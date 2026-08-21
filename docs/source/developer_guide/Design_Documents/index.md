@@ -9,6 +9,7 @@ patch
 cpu_binding
 ModelRunner_prepare_inputs
 disaggregated_prefill
+pd_separation_dual_stream
 eplb_swift_balancer
 ACL_Graph
 KV_Cache_Pool_Guide

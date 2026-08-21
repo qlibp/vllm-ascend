@@ -33,6 +33,7 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import init_ascend_config
 
 # isort: off
@@ -695,6 +696,14 @@ class NPUPlatform(Platform):
             )
             vllm_config.scheduler_config.enable_chunked_prefill = True
             vllm_config.scheduler_config.SLO_limits_for_dynamic_batch = ascend_config.SLO_limits_for_dynamic_batch
+
+        # Single-card P/D separation: schedule prefill and decode requests into
+        # two disjoint groups. This scheduler requires chunk-prefill to be off.
+        if envs.VLLM_ASCEND_ENABLE_PD_SEPARATION:
+            vllm_config.scheduler_config.scheduler_cls = (
+                "vllm_ascend.core.scheduler_pd_separation.SchedulerPDSeparation"
+            )
+            vllm_config.scheduler_config.enable_chunked_prefill = False
 
         # Use ProfilingChunkScheduler when profiling-based chunk sizing is on.
         if ascend_config.profiling_chunk_config.enabled:

@@ -110,6 +110,48 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable single-card P/D (prefill/decode) separated concurrent
+    # computation based on dual npu-stream. When enabled, prefill requests and
+    # decode requests are scheduled into two disjoint groups and executed
+    # concurrently on a prefill-stream and a decode-stream, each replaying its
+    # own aclgraph. Disabled (0) by default.
+    "VLLM_ASCEND_ENABLE_PD_SEPARATION": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_PD_SEPARATION", "0"))
+    ),
+    # Number of AI cube cores partitioned to the prefill-stream when P/D
+    # separation is enabled. -1 means the runtime default (do not call
+    # set_stream_limit). Valid range: -1 or a positive integer not exceeding the
+    # device's cube core count.
+    "VLLM_ASCEND_PD_SEPARATION_PREFILL_CUBE_NUM": lambda: int(
+        os.getenv("VLLM_ASCEND_PD_SEPARATION_PREFILL_CUBE_NUM", "12")
+    ),
+    # Number of AI vector cores partitioned to the prefill-stream when P/D
+    # separation is enabled. -1 means the runtime default.
+    "VLLM_ASCEND_PD_SEPARATION_PREFILL_VECTOR_NUM": lambda: int(
+        os.getenv("VLLM_ASCEND_PD_SEPARATION_PREFILL_VECTOR_NUM", "24")
+    ),
+    # Number of AI cube cores partitioned to the decode-stream when P/D
+    # separation is enabled. -1 means the runtime default.
+    "VLLM_ASCEND_PD_SEPARATION_DECODE_CUBE_NUM": lambda: int(
+        os.getenv("VLLM_ASCEND_PD_SEPARATION_DECODE_CUBE_NUM", "12")
+    ),
+    # Number of AI vector cores partitioned to the decode-stream when P/D
+    # separation is enabled. -1 means the runtime default.
+    "VLLM_ASCEND_PD_SEPARATION_DECODE_VECTOR_NUM": lambda: int(
+        os.getenv("VLLM_ASCEND_PD_SEPARATION_DECODE_VECTOR_NUM", "24")
+    ),
+    # Maximum number of prefill tokens captured by the static prefill-graph.
+    # -1 means derive it from the scheduler's max_num_batched_tokens. Requests
+    # larger than this will not be chunked; they simply wait for a step where
+    # they fit within the static prefill batch.
+    "VLLM_ASCEND_PD_SEPARATION_MAX_PREFILL_TOKENS": lambda: int(
+        os.getenv("VLLM_ASCEND_PD_SEPARATION_MAX_PREFILL_TOKENS", "-1")
+    ),
+    # Maximum number of decode tokens captured by the static decode-graph.
+    # -1 means derive it from max_num_seqs (one token per request).
+    "VLLM_ASCEND_PD_SEPARATION_MAX_DECODE_TOKENS": lambda: int(
+        os.getenv("VLLM_ASCEND_PD_SEPARATION_MAX_DECODE_TOKENS", "-1")
+    ),
 }
 
 # end-env-vars-definition
