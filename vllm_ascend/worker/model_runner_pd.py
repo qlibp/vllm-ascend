@@ -43,6 +43,7 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.utils import reorder_batch_to_split_decodes_and_prefills
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
@@ -80,12 +81,24 @@ class PDDualStreamModelRunner(NPUModelRunner):
         # decode_query_len == 1 + num_spec_tokens; with no spec decode this is 1.
         self.decode_query_len = self.decode_threshold
 
-        self._pd_manager = PDDualStreamGraphManager(self.pd_config, self.device)
         # Set only after both graphs are captured (see capture_model).
         self._pd_graphs_captured = False
-        # Static per-group buffer capacity, derived lazily at capture time.
+        # Static per-group buffer capacity.  Derive it here (once) from the
+        # runner's batch limits when the env var is left at its -1 default, so
+        # the graph manager can pre-allocate its static input buffers up front.
         self._pd_prefill_tokens = self.pd_config.max_prefill_tokens
         self._pd_decode_tokens = self.pd_config.max_decode_tokens
+        if self._pd_prefill_tokens <= 0:
+            self._pd_prefill_tokens = self.max_num_tokens
+        if self._pd_decode_tokens <= 0:
+            self._pd_decode_tokens = self.max_num_reqs
+
+        self._pd_manager = PDDualStreamGraphManager(
+            self.pd_config,
+            self.device,
+            prefill_tokens=self._pd_prefill_tokens,
+            decode_tokens=self._pd_decode_tokens,
+        )
 
     # ------------------------------------------------------------------ #
     # Guard rails
@@ -128,28 +141,27 @@ class PDDualStreamModelRunner(NPUModelRunner):
         fixed: decode graph = ``max_decode_tokens`` (one token per request),
         prefill graph = ``max_prefill_tokens``.
         """
-        if self._pd_prefill_tokens <= 0:
-            self._pd_prefill_tokens = self.max_num_tokens
-        if self._pd_decode_tokens <= 0:
-            self._pd_decode_tokens = self.max_num_reqs
-
         # Run one eager dummy forward to warm up lazy init / op caches before
         # capturing, mirroring _dummy_run but avoiding the parent's per-shape
         # FULL capture machinery.
         self._warm_up_for_pd_capture()
 
-        def capture_prefill() -> torch.Tensor:
+        def capture_prefill(input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
             return self._forward_for_capture(
                 num_tokens=self._pd_prefill_tokens,
                 num_reqs=max(1, self.max_num_reqs),
                 is_decode=False,
+                input_ids=input_ids,
+                positions=positions,
             )
 
-        def capture_decode() -> torch.Tensor:
+        def capture_decode(input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
             return self._forward_for_capture(
                 num_tokens=self._pd_decode_tokens,
                 num_reqs=max(1, self.max_num_reqs),
                 is_decode=True,
+                input_ids=input_ids,
+                positions=positions,
             )
 
         self._pd_manager.capture(capture_prefill, capture_decode)
@@ -166,10 +178,16 @@ class PDDualStreamModelRunner(NPUModelRunner):
         num_tokens: int,
         num_reqs: int,
         is_decode: bool,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Run one forward with dummy static inputs for graph capture."""
-        input_ids = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
-        positions = torch.zeros(num_tokens, dtype=torch.int64, device=self.device)
+        """Run one forward with the *static* inputs for graph capture.
+
+        ``input_ids`` / ``positions`` are the graph manager's pre-allocated
+        static tensors; their addresses get baked into the captured graph so
+        that staging the current step's values into the same tensors (before
+        replay) is what the graph actually reads.
+        """
         attn_metadata, _ = self._build_attention_metadata(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
@@ -183,7 +201,11 @@ class PDDualStreamModelRunner(NPUModelRunner):
             self.vllm_config,
             num_tokens=num_tokens,
             num_tokens_across_dp=None,
-            aclgraph_runtime_mode=CUDAGraphMode.FULL,
+            # NONE, not FULL: ``self.model`` is wrapped in an ACLGraphWrapper,
+            # which in FULL mode would capture its own sub-graph and conflict
+            # with the outer raw ``torch.npu.graph`` capture.  NONE makes it
+            # pass through eagerly so the outer capture records the forward.
+            aclgraph_runtime_mode=CUDAGraphMode.NONE,
             batch_descriptor=BatchDescriptor(num_tokens=num_tokens),
             num_actual_tokens=num_tokens,
             model_instance=self.model,
@@ -217,10 +239,15 @@ class PDDualStreamModelRunner(NPUModelRunner):
             scheduler_output.num_scheduled_tokens, self.decode_query_len
         )
 
-        # Split the scheduled tokens into two contiguous groups.  The scheduler
-        # guarantees decode-first ordering in self.running (and therefore in
-        # self.input_batch.req_ids), so decode tokens occupy the front of every
-        # per-token tensor and prefill tokens the tail.
+        # The scheduler reorders ``self.running`` decode-first, but the runner's
+        # persistent ``input_batch`` keeps its *own* ordering, so decode tokens
+        # are not necessarily contiguous at the front of the per-token tensors.
+        # Align the batch here so the ``input_ids[:num_decode_tokens]`` split in
+        # ``_run_dual_stream`` separates the two groups correctly (decode tokens
+        # front, prefill tokens tail).
+        self._reorder_decode_first(scheduler_output)
+
+        # Split the scheduled tokens into two contiguous groups.
         req_ids = self.input_batch.req_ids
         num_scheduled_tokens_np = np.array(
             [scheduler_output.num_scheduled_tokens[i] for i in req_ids],
@@ -311,6 +338,28 @@ class PDDualStreamModelRunner(NPUModelRunner):
         )
         return None
 
+    def _reorder_decode_first(self, scheduler_output: "SchedulerOutput") -> None:
+        """Reorder the persistent batch so decode requests precede prefill.
+
+        ``SchedulerPDSeparation`` reorders ``self.running`` decode-first, but the
+        runner's ``input_batch`` keeps its own persistent ordering, so decode
+        tokens are *not* necessarily contiguous at the front of the per-token
+        tensors.  This makes the ``input_ids[:num_decode_tokens]`` split in
+        ``_run_dual_stream`` hold: with no chunked prefill, every request with
+        ``num_scheduled_tokens <= decode_query_len`` is a decode request, and
+        ``reorder_batch_to_split_decodes_and_prefills`` places exactly those at
+        the front.
+
+        Degenerate one-token prompts (``num_computed == 0``) are classified as
+        prefill by the reorder and as decode by ``split_prefill_decode``; this
+        is the documented out-of-scope case and may mis-split such a request.
+        """
+        reorder_batch_to_split_decodes_and_prefills(
+            self.input_batch,
+            scheduler_output,
+            decode_threshold=self.decode_query_len,
+        )
+
     def _run_dual_stream(
         self,
         input_ids,
@@ -328,11 +377,6 @@ class PDDualStreamModelRunner(NPUModelRunner):
         Returns the concatenated hidden states in the original (decode-first)
         token order so the caller can index into it with ``logits_indices``.
         """
-        # TODO(remote-validate): The static input staging and the split of the
-        # attention metadata across the two graphs is the integration point that
-        # must be iterated on the NPU.  The stream/graph orchestration below is
-        # final; the per-tensor slicing of input_ids/positions and the split of
-        # ``attn_metadata`` into per-group forms is best-effort here.
         prefill_ctx = self._pd_manager.prefill_ctx
         decode_ctx = self._pd_manager.decode_ctx
 
@@ -344,29 +388,40 @@ class PDDualStreamModelRunner(NPUModelRunner):
         self._stage_static_inputs(decode_ctx, decode_input_ids, decode_positions)
         self._stage_static_inputs(prefill_ctx, prefill_input_ids, prefill_positions)
 
-        # NOTE: the graphs capture the *full* dummy attention metadata already,
-        # so at replay the per-group attention params must be refreshed into the
-        # graph workspaces.  For the initial cut we rely on the attention
-        # backend's graph params being keyed by num_tokens; a full per-group
-        # refresh is required on NPU.
+        # TODO(remote-validate): the graphs were captured with *dummy* attention
+        # metadata (block tables / slot mappings / sequence lengths).  Before
+        # each replay those per-group attention params must be refreshed into
+        # the graph workspaces for the *actual* requests, otherwise the graphs
+        # compute against stale kv-cache addresses.  This is the one remaining
+        # integration point that must be iterated on the NPU -- the static-input
+        # staging and output slicing above are final.
         self._pd_manager.run()
 
         # Read back the two outputs and concatenate them in decode-first order.
+        # The graphs replay to their full static shape, so slice each output
+        # back to its actual token count before concatenating.
         decode_out = decode_ctx.output
         prefill_out = prefill_ctx.output
         assert decode_out is not None and prefill_out is not None
+        decode_out = decode_out[:num_decode_tokens]
+        prefill_out = prefill_out[:num_prefill_tokens]
         return torch.cat([decode_out, prefill_out], dim=0)
 
     @staticmethod
     def _stage_static_inputs(ctx, input_ids: torch.Tensor, positions: torch.Tensor) -> None:
-        """Copy the current step's per-group inputs into the static buffers."""
-        if not ctx.static_inputs:
-            ctx.static_inputs = [
-                torch.empty_like(input_ids),
-                torch.empty_like(positions),
-            ]
-        ctx.static_inputs[0][: input_ids.shape[0]].copy_(input_ids, non_blocking=True)
-        ctx.static_inputs[1][: positions.shape[0]].copy_(positions, non_blocking=True)
+        """Copy the current step's per-group inputs into the static buffers.
+
+        The actual tokens are front-packed and the tail is zero-padded to the
+        static shape; the padded tail is masked off by the (static) attention
+        metadata and sliced away on readback.
+        """
+        num_tokens = input_ids.shape[0]
+        # Zero the tail so replay never reads stale values from a previous
+        # step's larger batch (positions in particular must not be negative).
+        ctx.static_input_ids.zero_()
+        ctx.static_positions.zero_()
+        ctx.static_input_ids[:num_tokens].copy_(input_ids, non_blocking=True)
+        ctx.static_positions[:num_tokens].copy_(positions, non_blocking=True)
 
     # ------------------------------------------------------------------ #
     # Sample

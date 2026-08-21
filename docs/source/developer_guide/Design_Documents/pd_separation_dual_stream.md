@@ -132,16 +132,50 @@ correct.
 2. **The two graphs never share static input/output buffers.** Every buffer is
    owned by exactly one `PDStreamContext`. This is the real trampling risk — not
    the kv-cache.
-3. **kv-cache is shared, on purpose, and safe.** Both graphs run in the same
+3. **Capture runs with `aclgraph_runtime_mode=NONE`.** The model is wrapped in
+   an `ACLGraphWrapper`; in `FULL` mode that wrapper would capture its *own*
+   sub-graph and conflict with the outer raw `torch.npu.graph` capture. `NONE`
+   makes it pass through eagerly so the outer capture records the forward.
+4. **kv-cache is shared, on purpose, and safe.** Both graphs run in the same
    worker process against the same `kv_caches`, but the scheduler hands the
    prefill group and the decode group **disjoint blocks**, so no kv-cache slot is
    ever written by both streams in the same step.
-4. **Stream ordering.** Before replay each stream `wait_stream(default_stream)`
-   so the host→device copies of the static buffers are visible; after replay the
-   default stream `wait_stream`s both streams so logits are read only after both
-   graphs complete.
-5. **`set_stream_limit` is applied only when enabled.** A `-1` cube/vector count
+5. **Event-level sync, no device barrier on the hot path.** Before replay each
+   stream `wait_stream(default_stream)` so the host→device copies of the static
+   buffers are visible; each stream records a `done_event` immediately after
+   replay; the default stream `wait_event`s both done events before reading
+   logits. `torch.npu.synchronize()` is called *only* once, after capture.
+6. **The single cross-stream dependency is the cross-step P→D handoff.** Step
+   N+1's decode stream `wait_event`s step N's prefill `done_event` (a request
+   that just prefilled now enters decode and its kv-cache must be visible).
+   Within a step the two streams never wait on each other.
+7. **Decode-first token order.** The scheduler reorders `self.running`
+   decode-first, and the runner reorders its persistent `input_batch` the same
+   way before slicing the per-token tensors, so decode tokens are contiguous at
+   the front (`input_ids[:num_decode_tokens]`) and prefill tokens at the tail.
+8. **`set_stream_limit` is applied only when enabled.** A `-1` cube/vector count
    disables `set_stream_limit` for that stream and keeps the runtime default.
+
+### 4. Execution-level pipeline boundary
+
+The two streams are **persistent** and keep computing without a device-level
+barrier, but the host engine loop is still step-by-step. vLLM v1 drives the
+runner synchronously (`schedule → execute_model → sample_tokens →
+update_from_output`), and on a single card the `UniProcExecutor` runs
+`execute_model` in the same process — there is no background thread, so
+`non_block=True` still completes the step before returning. Consequently the
+"continuous" behavior is at the **NPU stream level**: the prefill-kernels and
+decode-kernels interleave on the device without any `torch.npu.synchronize()`
+in the hot path, while the host advances one step at a time.
+
+Within that boundary the only cross-stream dependency is the cross-step P→D
+handoff: step N+1's decode stream waits on step N's prefill `done_event`
+(because a request that prefilled at step N enters decode at step N+1 and its
+kv-cache writes must be visible). Within a step the prefill and decode streams
+are fully independent — they are replayed back-to-back and overlap on the
+device. This is a genuine *pipeline* at the execution layer; full scheduling
+decoupling (overlapping the host schedule of step N+1 with the execution of
+step N) is out of scope and would require changes to vLLM core.
 
 ---
 
@@ -174,7 +208,16 @@ partition.
   parallelism (decode or prefill), multimodal / encoder-decoder models, LoRA,
   and `kv_sharing_fast_prefill`. These are rejected at runner construction.
 * Degenerate one-token prompts are indistinguishable from decode steps by the
-  `num_tokens == decode_query_len` rule and are treated as decode.
+  `num_tokens == decode_query_len` rule and are treated as decode. Such a
+  request is also placed in the prefill region by the decode-first reorder, so
+  it may be mis-split when mixed with a real prefill in the same step.
 * The static prefill/decode graphs capture a fixed batch shape
   (`MAX_PREFILL_TOKENS` / `MAX_DECODE_TOKENS`). A prefill request larger than the
   static prefill batch is *not* chunked — it waits for a step where it fits.
+* **Per-group attention-metadata refresh is the remaining integration point
+  (not yet resolved).** The graphs are captured with *dummy* attention metadata
+  (block tables / slot mappings / sequence lengths). Before each replay those
+  per-group attention params must be refreshed into the graph workspaces for
+  the actual requests; until then the graphs compute against stale kv-cache
+  addresses. This is flagged `TODO(remote-validate)` in
+  `model_runner_pd.py::_run_dual_stream` and must be validated on the NPU.

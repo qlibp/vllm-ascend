@@ -118,6 +118,15 @@ class SchedulerPDSeparation(Scheduler):
 
         # Re-order running so the decode group precedes the prefill group.
         # The relative order inside each group is preserved (FCFS).
+        #
+        # This decode-first order is a *contract* with the runner
+        # (``PDDualStreamModelRunner``): the runner re-derives the same
+        # decode/prefill partition via ``split_prefill_decode`` and then reorders
+        # its persistent ``input_batch`` decode-first before slicing the
+        # per-token tensors into ``input_ids[:num_decode_tokens]``.  Note that
+        # the runner's ``input_batch`` does *not* inherit this order
+        # automatically (it keeps its own persistent ordering), so the runner
+        # must do the reorder itself (``_reorder_decode_first``).
         decode_reqs = [
             req
             for req in self.running

@@ -30,11 +30,21 @@ Core invariants (do not break these):
    owned by exactly one :class:`PDStreamContext`.  The scheduler guarantees the
    request sets are disjoint, so the same kv-cache slot is never written by
    both streams in the same step (kv-cache itself *is* shared, on purpose).
-3. **Stream ordering.**  Before replay, each stream ``wait_stream(default)`` so
-   the host->device copies of the static buffers are visible; after replay the
-   default stream ``wait_stream`` both streams so logits are read only after
-   both graphs complete.
-4. **``set_stream_limit`` is applied only when enabled** (non-negative cube/vec
+3. **Capture runs with ``aclgraph_runtime_mode=NONE``.**  The model is wrapped
+   in an ``ACLGraphWrapper`` (``model_runner_v1.load_model``); in ``FULL`` mode
+   that wrapper would capture its *own* sub-graph and conflict with our outer
+   raw ``torch.npu.graph`` capture.  ``NONE`` makes it pass through eagerly so
+   the outer capture records the eager forward.
+4. **Event-level sync, no device barrier on the hot path.**  Before replay each
+   stream ``wait_stream(default)`` so the host->device copies of the static
+   buffers are visible; each stream records a ``done_event`` immediately after
+   replay; the default stream ``wait_event``s both done events before reading
+   logits.  ``torch.npu.synchronize()`` is called *only* once, after capture.
+5. **The single cross-stream dependency is the cross-step P->D handoff.**  Step
+   N+1's decode stream ``wait_event``s step N's prefill ``done_event`` (a
+   request that just prefilled now enters decode and its kv-cache must be
+   visible).  Within a step the two streams never wait on each other.
+6. **``set_stream_limit`` is applied only when enabled** (non-negative cube/vec
    counts), once per stream after capture.
 """
 
@@ -129,9 +139,12 @@ class PDStreamContext:
         device: torch.device,
         cube_num: int,
         vector_num: int,
+        max_tokens: int,
     ) -> None:
         self.name = name
         self.device = device
+        # Static batch capacity (in tokens) this graph is captured for.
+        self.max_tokens = max_tokens
         # The stream that replays (and, during capture, runs) this graph.
         self.stream = torch.npu.Stream(device=device)
         # NPU graph capture must happen on a non-default stream; keep a
@@ -141,12 +154,24 @@ class PDStreamContext:
         self.cube_num = cube_num
         self.vector_num = vector_num
 
+        # Done event: recorded on ``self.stream`` immediately after replay and
+        # waited on by (a) the default stream for readback and (b), for the
+        # prefill stream only, by the *next* step's decode stream (cross-step
+        # P->D handoff).  It is persistent across steps; re-recording is safe
+        # because each replay stream ``wait_stream(default)`` before replay,
+        # which orders the re-record after the previous step's default-stream
+        # reads (including the previous ``wait_event`` on this event).
+        self.done_event = torch.npu.Event()
+
+        # Static input tensors whose *addresses* are baked into the graph.  The
+        # runner copies the current step's values into these (front-packed,
+        # tail zero-padded) before replay.  input_ids is int32, positions int64.
+        self.static_input_ids = torch.zeros(max_tokens, dtype=torch.int32, device=device)
+        self.static_positions = torch.zeros(max_tokens, dtype=torch.int64, device=device)
+
         # Populated by ``PDDualStreamGraphManager.capture``.
         self.graph: torch.npu.NPUGraph | None = None
         self.output: torch.Tensor | None = None
-        # Static input tensors whose addresses are baked into the graph.  The
-        # runner copies the current step's values into these before replay.
-        self.static_inputs: list[torch.Tensor] = []
 
     @property
     def is_captured(self) -> bool:
@@ -176,20 +201,38 @@ class PDDualStreamGraphManager:
     capture stream inside ``torch.npu.graph(graph)`` -- deliberately *without*
     a shared ``pool`` so the two graphs get independent memory pools.
 
-    ``run`` replays both graphs concurrently on their two streams and inserts
-    the required cross-stream dependencies (see module docstring invariant 3).
+    ``run`` replays both graphs concurrently on their two streams, using
+    event-level cross-stream synchronization (see module docstring invariants 4
+    and 5): no device-level ``synchronize()`` is ever issued on the hot path.
     """
 
-    def __init__(self, config: PDSeparationConfig, device: torch.device) -> None:
+    def __init__(
+        self,
+        config: PDSeparationConfig,
+        device: torch.device,
+        prefill_tokens: int,
+        decode_tokens: int,
+    ) -> None:
         self.config = config
         self.device = device
         self.default_stream = torch.npu.default_stream(device)
         self.prefill_ctx = PDStreamContext(
-            "prefill", device, config.prefill_cube_num, config.prefill_vector_num
+            "prefill",
+            device,
+            config.prefill_cube_num,
+            config.prefill_vector_num,
+            max_tokens=prefill_tokens,
         )
         self.decode_ctx = PDStreamContext(
-            "decode", device, config.decode_cube_num, config.decode_vector_num
+            "decode",
+            device,
+            config.decode_cube_num,
+            config.decode_vector_num,
+            max_tokens=decode_tokens,
         )
+        # Cross-step handoff guard: the very first step has no previous prefill
+        # to wait on.
+        self._has_run = False
 
     @property
     def is_captured(self) -> bool:
@@ -197,52 +240,84 @@ class PDDualStreamGraphManager:
 
     def capture(
         self,
-        prefill_capture_fn: Callable[[], torch.Tensor],
-        decode_capture_fn: Callable[[], torch.Tensor],
+        prefill_capture_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        decode_capture_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     ) -> None:
         """Capture the two graphs on their dedicated side capture-streams.
 
-        Each callback must run the model forward with the *static* inputs of
-        its group already staged and the forward context already set, and must
-        return the static output tensor (which the graph will later overwrite
-        on replay).
+        Each callback is handed its context's *static* input tensors
+        (``static_input_ids``, ``static_positions``), whose addresses get baked
+        into the graph, and must return the static output tensor (which the
+        graph later overwrites on replay).
         """
         if self.is_captured:
             raise RuntimeError("PD dual-stream graphs have already been captured")
 
         self.prefill_ctx.graph = torch.npu.NPUGraph()
         with torch.npu.graph(self.prefill_ctx.graph, stream=self.prefill_ctx.capture_stream):
-            self.prefill_ctx.output = prefill_capture_fn()
+            self.prefill_ctx.output = prefill_capture_fn(
+                self.prefill_ctx.static_input_ids,
+                self.prefill_ctx.static_positions,
+            )
         logger.info("Captured prefill graph on %s stream.", self.prefill_ctx.name)
 
         self.decode_ctx.graph = torch.npu.NPUGraph()
         with torch.npu.graph(self.decode_ctx.graph, stream=self.decode_ctx.capture_stream):
-            self.decode_ctx.output = decode_capture_fn()
+            self.decode_ctx.output = decode_capture_fn(
+                self.decode_ctx.static_input_ids,
+                self.decode_ctx.static_positions,
+            )
         logger.info("Captured decode graph on %s stream.", self.decode_ctx.name)
 
         self.prefill_ctx.apply_stream_limit()
         self.decode_ctx.apply_stream_limit()
+        # One-time barrier after capture (not on the replay hot path).
         torch.npu.synchronize()
 
     def run(self) -> None:
-        """Concurrently replay both graphs on their two streams."""
+        """Concurrently replay both graphs on their two streams.
+
+        The host engine loop is synchronous (one ``run`` per step), so the two
+        replay streams are the only concurrency: they interleave their kernels
+        on the device while the host proceeds step-by-step.  Cross-step P->D
+        handoff is the only place a replay stream waits on the *other* stream's
+        work (and always on the *previous* step's prefill).
+        """
         if not self.is_captured:
             raise RuntimeError("PD dual-stream graphs have not been captured")
 
-        prefill_graph = self.prefill_ctx.graph
-        decode_graph = self.decode_ctx.graph
+        prefill_ctx = self.prefill_ctx
+        decode_ctx = self.decode_ctx
+        prefill_graph = prefill_ctx.graph
+        decode_graph = decode_ctx.graph
         assert prefill_graph is not None and decode_graph is not None
 
-        # The static buffers were written on the default stream; make each
-        # replay stream wait on those copies before launching.
-        with torch.npu.stream(self.prefill_ctx.stream):
-            self.prefill_ctx.stream.wait_stream(self.default_stream)
-            prefill_graph.replay()
-        with torch.npu.stream(self.decode_ctx.stream):
-            self.decode_ctx.stream.wait_stream(self.default_stream)
-            decode_graph.replay()
+        # Cross-step P->D handoff: this step's decode stream must not start
+        # until the *previous* step's prefill completed -- a request that just
+        # prefilled now enters decode and its kv-cache writes must be visible.
+        # This is the single cross-stream dependency; ``wait_stream(default)``
+        # below would also transitively cover it, but we spell it out so the
+        # handoff stays explicit if the default-stream join is ever relaxed.
+        if self._has_run:
+            with torch.npu.stream(decode_ctx.stream):
+                decode_ctx.stream.wait_event(prefill_ctx.done_event)
 
-        # The default stream will read both outputs during logits/sampling, so
-        # it must wait for both graphs to finish.
-        self.default_stream.wait_stream(self.prefill_ctx.stream)
-        self.default_stream.wait_stream(self.decode_ctx.stream)
+        # Concurrent replay.  Each stream first waits on the default stream so
+        # the host->device copies of its static input buffers are visible, then
+        # replays and immediately records its done event.  No device-level
+        # synchronize() anywhere on this hot path.
+        with torch.npu.stream(prefill_ctx.stream):
+            prefill_ctx.stream.wait_stream(self.default_stream)
+            prefill_graph.replay()
+            prefill_ctx.done_event.record()
+        with torch.npu.stream(decode_ctx.stream):
+            decode_ctx.stream.wait_stream(self.default_stream)
+            decode_graph.replay()
+            decode_ctx.done_event.record()
+
+        # Readback: the default stream reads both outputs for logits/sampling,
+        # so it waits on each graph's done event (event-level, not a barrier).
+        self.default_stream.wait_event(prefill_ctx.done_event)
+        self.default_stream.wait_event(decode_ctx.done_event)
+
+        self._has_run = True
