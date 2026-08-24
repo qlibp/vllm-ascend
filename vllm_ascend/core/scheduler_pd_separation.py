@@ -50,6 +50,7 @@ from vllm.distributed.kv_events import KVEventBatch
 from vllm.logger import logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -148,6 +149,8 @@ class SchedulerPDSeparation(Scheduler):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
         scheduled_timestamp = time.monotonic()
+
+        self.kv_cache_manager.new_step_starts()
 
         # First, schedule the RUNNING requests (decode group first, then any
         # still-incomplete prefill group).
@@ -506,3 +509,16 @@ class SchedulerPDSeparation(Scheduler):
 
         self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+
+class AsyncSchedulerPDSeparation(AsyncScheduler, SchedulerPDSeparation):
+    """Async-scheduling variant of :class:`SchedulerPDSeparation`.
+
+    ``SchedulerPDSeparation`` only reimplements ``schedule()``; the async
+    scheduler relies on ``num_output_placeholders`` bookkeeping in
+    ``AsyncScheduler._update_after_schedule`` / ``_update_request_with_output``
+    to advance decode requests (the worker caches sampled tokens on-device and
+    does not return them to the scheduler).  Without that bookkeeping the
+    scheduler sees ``num_tokens_with_spec == num_computed_tokens`` after the
+    first prefill and spins forever scheduling zero tokens.
+    """

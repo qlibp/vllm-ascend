@@ -48,6 +48,7 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import reorder_batch_to_split_decodes_and_prefills
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendMetadata
@@ -654,7 +655,7 @@ class PDDualStreamModelRunner(NPUModelRunner):
     # ------------------------------------------------------------------ #
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
-    ) -> ModelRunnerOutput:
+    ) -> ModelRunnerOutput | AsyncGPUModelRunnerOutput:
         if self.execute_model_state is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
@@ -692,7 +693,7 @@ class PDDualStreamModelRunner(NPUModelRunner):
             spec_decode_metadata,
         )
 
-        return ModelRunnerOutput(
+        model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
             sampled_token_ids=valid_sampled_token_ids,
@@ -701,3 +702,26 @@ class PDDualStreamModelRunner(NPUModelRunner):
             pooler_output=[],
             cudagraph_stats=cudagraph_stats,
         )
+
+        if not self.use_async_scheduling:
+            return model_runner_output
+
+        # Mirror NPUModelRunner.sample_tokens: under async scheduling the
+        # scheduler advances requests via num_output_placeholders and the actual
+        # sampled token ids are copied to the host asynchronously.  Returning the
+        # raw ModelRunnerOutput here (with empty sampled_token_ids produced by
+        # _bookkeeping_sync's async branch) would make the scheduler emit no
+        # EngineCoreOutputs and never finish the request.
+        async_output = AsyncGPUModelRunnerOutput(
+            model_runner_output=model_runner_output,
+            sampled_token_ids=sampler_output.sampled_token_ids,
+            logprobs_tensors=sampler_output.logprobs_tensors,
+            invalid_req_indices=invalid_req_indices,
+            async_output_copy_stream=self.async_output_copy_stream,
+            vocab_size=self.input_batch.vocab_size,
+        )
+        self.input_batch.set_async_sampled_token_ids(
+            async_output.sampled_token_ids_cpu,
+            async_output.async_copy_ready_event,
+        )
+        return async_output

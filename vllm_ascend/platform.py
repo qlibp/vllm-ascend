@@ -700,9 +700,15 @@ class NPUPlatform(Platform):
         # Single-card P/D separation: schedule prefill and decode requests into
         # two disjoint groups. This scheduler requires chunk-prefill to be off.
         if envs.VLLM_ASCEND_ENABLE_PD_SEPARATION:
-            vllm_config.scheduler_config.scheduler_cls = (
-                "vllm_ascend.core.scheduler_pd_separation.SchedulerPDSeparation"
-            )
+            if vllm_config.scheduler_config.async_scheduling:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.scheduler_pd_separation."
+                    "AsyncSchedulerPDSeparation"
+                )
+            else:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.scheduler_pd_separation.SchedulerPDSeparation"
+                )
             vllm_config.scheduler_config.enable_chunked_prefill = False
 
         # Use ProfilingChunkScheduler when profiling-based chunk sizing is on.
