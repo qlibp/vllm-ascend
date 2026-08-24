@@ -194,6 +194,22 @@ class PDDualStreamModelRunner(NPUModelRunner):
         # ``profile_cudagraph_memory``, trip over the globally-disabled flag).
         self._dummy_run(self.max_num_reqs, cudagraph_runtime_mode=CUDAGraphMode.NONE)
 
+    @staticmethod
+    def _num_scheduled_tokens_for_capture(
+        num_tokens: int, num_reqs: int
+    ) -> np.ndarray:
+        """Distribute ``num_tokens`` across ``num_reqs`` for capture metadata.
+
+        Mirrors the non-uniform branch of ``_dummy_run``: each request gets
+        ``num_tokens // num_reqs`` tokens and the last request absorbs the
+        remainder, so the cumulative sum ends exactly at ``num_tokens``.
+        """
+        min_tokens_per_req = num_tokens // num_reqs
+        remainder = num_tokens % num_reqs
+        num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+        num_scheduled_tokens_list[-1] += remainder
+        return np.array(num_scheduled_tokens_list, dtype=np.int32)
+
     def _forward_for_capture(
         self,
         num_tokens: int,
@@ -210,12 +226,41 @@ class PDDualStreamModelRunner(NPUModelRunner):
         the captured graph so that staging the current step's values into the
         same tensors (before replay) is what the graph actually reads.
         """
+        max_query_len = 1 if is_decode else num_tokens
+
+        # Populate the persistent query-length buffers *before* building the
+        # attention metadata.  ``_build_attention_metadata`` derives
+        # ``actual_seq_lengths_q`` from ``self.query_start_loc.cpu``; the FIA
+        # TND kernel requires its last element to equal ``num_tokens`` (the
+        # first dim of the query/hidden states).  The warm-up dummy run leaves
+        # these buffers sized for its own (small) batch, so without this the
+        # prefill capture would reuse e.g. ``actual_seq_lengths_q[-1] ==
+        # max_num_reqs`` while ``num_tokens == max_prefill_tokens``, tripping
+        # the FIA ``queryT == actualSequenceLengthQ[-1]`` check.
+        #
+        # These are pure CPU-side assignments (no device copies), so they are
+        # not baked into the captured graph; they only fix the metadata the
+        # capture-time forward sees.
+        num_scheduled_tokens = self._num_scheduled_tokens_for_capture(
+            num_tokens, num_reqs
+        )
+        cum_num_tokens = self._get_cumsum_and_arange(
+            num_scheduled_tokens, self.query_pos.np
+        )
+        self.query_start_loc.np[0] = 0
+        self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+        # Mirrors ``_dummy_run``: during graph capture every request is given
+        # the same (dummy) seq_len; the per-request values are re-bound before
+        # each replay via the attention task-group update path.
+        self.optimistic_seq_lens_cpu[:num_reqs] = max_query_len
+        self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+
         attn_metadata, _ = self._build_attention_metadata(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             num_tokens_padded=num_tokens,
             num_reqs_padded=num_reqs,
-            max_query_len=1 if is_decode else num_tokens,
+            max_query_len=max_query_len,
             for_cudagraph_capture=True,
         )
         # Rebind the KV-write slot_mapping to this graph's *private* static
