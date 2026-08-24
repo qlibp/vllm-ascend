@@ -189,17 +189,11 @@ class PDStreamContext:
         # per stream is what stops the prefill and decode graphs from reading
         # each other's slots.
         #
-        # Initialized with distinct valid slot ids (0..max_tokens-1) rather than
-        # zeros: reshape_and_cache validates its slot_mapping during capture
-        # (the AscendTB ReshapeAndCache op requires values within
-        # (-num_blocks*block_size, num_blocks*block_size) *and* no duplicates),
-        # so an all-zero buffer would make the capture-time ``setup`` fail.
-        # On replay this buffer is fully re-staged (front-packed real slots,
-        # tail -1) before the graph runs, so the initial values only matter for
-        # capture.
-        self.static_slot_mapping = torch.arange(
-            max_tokens, dtype=torch.int64, device=device
-        )
+        # Must be int32 to match the native slot_mapping buffer
+        # (``vllm_ascend.worker.block_table.BlockTable`` allocates it as
+        # torch.int32), which is what ``_npu_reshape_and_cache`` /
+        # ``ReshapeAndCacheOperation`` expects for its ``slots`` input.
+        self.static_slot_mapping = torch.zeros(max_tokens, dtype=torch.int32, device=device)
 
         # Populated by ``PDDualStreamGraphManager.capture``.
         self.graph: torch.npu.NPUGraph | None = None
