@@ -35,11 +35,13 @@ rejected loudly at construction (see :meth:`_assert_pd_separation_supported`).
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import numpy as np
 import torch
 
+from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
@@ -47,7 +49,8 @@ from vllm.v1.attention.backends.utils import reorder_batch_to_split_decodes_and_
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
-from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
+from vllm_ascend.attention.attention_v1 import AscendMetadata
 from vllm_ascend.worker.model_runner_v1 import ExecuteModelState, NPUModelRunner
 from vllm_ascend.worker.pd_separation import (
     PDDualStreamGraphManager,
@@ -98,6 +101,8 @@ class PDDualStreamModelRunner(NPUModelRunner):
             self.device,
             prefill_tokens=self._pd_prefill_tokens,
             decode_tokens=self._pd_decode_tokens,
+            attn_backend=self.attn_backend,
+            vllm_config=self.vllm_config,
         )
 
     # ------------------------------------------------------------------ #
@@ -153,6 +158,7 @@ class PDDualStreamModelRunner(NPUModelRunner):
                 is_decode=False,
                 input_ids=input_ids,
                 positions=positions,
+                static_slot_mapping=self._pd_manager.prefill_ctx.static_slot_mapping,
             )
 
         def capture_decode(input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -162,16 +168,31 @@ class PDDualStreamModelRunner(NPUModelRunner):
                 is_decode=True,
                 input_ids=input_ids,
                 positions=positions,
+                static_slot_mapping=self._pd_manager.decode_ctx.static_slot_mapping,
             )
 
-        self._pd_manager.capture(capture_prefill, capture_decode)
+        # ``profile_cudagraph_memory`` disables cudagraph capturing globally
+        # before ``capture_model`` is called.  The parent runner re-enables it
+        # around its own capture; do the same for the raw ``torch.npu.graph``
+        # capture below, then restore the disabled state so any unexpected
+        # capture after startup is still detected.
+        set_cudagraph_capturing_enabled(True)
+        try:
+            self._pd_manager.capture(capture_prefill, capture_decode)
+        finally:
+            set_cudagraph_capturing_enabled(False)
         self._pd_graphs_captured = True
         # Pool memory is managed internally by the two private pools; report 0
         # extra bytes to the caller so it does not double-count.
         return 0
 
     def _warm_up_for_pd_capture(self) -> None:
-        self._dummy_run(self.max_num_reqs)
+        # Run an *eager* dummy forward to warm up lazy init / op caches before
+        # the raw graph capture.  Passing NONE keeps the parent ``_dummy_run``
+        # from entering its FULL/PIECEWISE capture machinery (which would call
+        # ``validate_cudagraph_capturing_enabled`` and, after
+        # ``profile_cudagraph_memory``, trip over the globally-disabled flag).
+        self._dummy_run(self.max_num_reqs, cudagraph_runtime_mode=CUDAGraphMode.NONE)
 
     def _forward_for_capture(
         self,
@@ -180,13 +201,14 @@ class PDDualStreamModelRunner(NPUModelRunner):
         is_decode: bool,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        static_slot_mapping: torch.Tensor,
     ) -> torch.Tensor:
         """Run one forward with the *static* inputs for graph capture.
 
-        ``input_ids`` / ``positions`` are the graph manager's pre-allocated
-        static tensors; their addresses get baked into the captured graph so
-        that staging the current step's values into the same tensors (before
-        replay) is what the graph actually reads.
+        ``input_ids`` / ``positions`` / ``static_slot_mapping`` are the graph
+        manager's pre-allocated static tensors; their addresses get baked into
+        the captured graph so that staging the current step's values into the
+        same tensors (before replay) is what the graph actually reads.
         """
         attn_metadata, _ = self._build_attention_metadata(
             num_tokens=num_tokens,
@@ -196,6 +218,16 @@ class PDDualStreamModelRunner(NPUModelRunner):
             max_query_len=1 if is_decode else num_tokens,
             for_cudagraph_capture=True,
         )
+        # Rebind the KV-write slot_mapping to this graph's *private* static
+        # buffer.  reshape_and_cache is a plain captured op (not part of the
+        # FIA task-group update path), so it reads whatever address was baked
+        # here; pointing each graph at its own buffer and re-staging that
+        # buffer before each replay keeps prefill/decode slots disjoint.
+        for layer_name, meta in attn_metadata.items():
+            if meta is not None:
+                attn_metadata[layer_name] = dataclasses.replace(
+                    meta, slot_mapping=static_slot_mapping
+                )
         with set_ascend_forward_context(
             attn_metadata,
             self.vllm_config,
@@ -211,6 +243,11 @@ class PDDualStreamModelRunner(NPUModelRunner):
             model_instance=self.model,
             input_ids=input_ids,
         ):
+            # ``set_ascend_forward_context`` resets ``capturing`` to False.
+            # Flip it back to True while inside ``torch.npu.graph`` so the
+            # attention ops record updatable task groups (graph_task_group_*
+            # + attn_params/handles/events) instead of the eager path.
+            _EXTRA_CTX.capturing = torch.npu.is_current_stream_capturing()
             hidden_states = self._model_forward(
                 num_tokens, input_ids=input_ids, positions=positions
             )
@@ -290,6 +327,8 @@ class PDDualStreamModelRunner(NPUModelRunner):
                 positions=positions,
                 inputs_embeds=inputs_embeds,
                 attn_metadata=attn_metadata,
+                num_decode_reqs=len(decode_req_ids),
+                num_prefill_reqs=len(prefill_req_ids),
                 num_decode_tokens=num_decode_tokens,
                 num_prefill_tokens=num_prefill_tokens,
                 total_num_scheduled_tokens=total_num_scheduled_tokens,
@@ -366,6 +405,8 @@ class PDDualStreamModelRunner(NPUModelRunner):
         positions,
         inputs_embeds,
         attn_metadata,
+        num_decode_reqs: int,
+        num_prefill_reqs: int,
         num_decode_tokens: int,
         num_prefill_tokens: int,
         total_num_scheduled_tokens: int,
@@ -388,14 +429,41 @@ class PDDualStreamModelRunner(NPUModelRunner):
         self._stage_static_inputs(decode_ctx, decode_input_ids, decode_positions)
         self._stage_static_inputs(prefill_ctx, prefill_input_ids, prefill_positions)
 
-        # TODO(remote-validate): the graphs were captured with *dummy* attention
-        # metadata (block tables / slot mappings / sequence lengths).  Before
-        # each replay those per-group attention params must be refreshed into
-        # the graph workspaces for the *actual* requests, otherwise the graphs
-        # compute against stale kv-cache addresses.  This is the one remaining
-        # integration point that must be iterated on the NPU -- the static-input
-        # staging and output slicing above are final.
-        self._pd_manager.run()
+        # Stage each group's KV-write slot_mapping into its private static
+        # buffer.  The combined slot_mapping is decode-first: decode slots live
+        # in [0, num_decode_tokens) and prefill slots in
+        # [num_decode_tokens, total).  The tail is filled with -1 (PAD_SLOT_ID)
+        # so the padded tokens of each static graph are no-op KV writes.
+        combined_slot_mapping = self._get_combined_slot_mapping(attn_metadata)
+        self._stage_static_slot_mapping(
+            decode_ctx, combined_slot_mapping[:num_decode_tokens]
+        )
+        self._stage_static_slot_mapping(
+            prefill_ctx,
+            combined_slot_mapping[num_decode_tokens : num_decode_tokens + num_prefill_tokens],
+        )
+
+        # Build static-shaped per-group attention metadata for the actual
+        # requests (front-packed and zero-padded to each graph's capture shape)
+        # and refresh each graph's attention task groups before replay.
+        decode_attn_metadata = self._build_group_attention_metadata(
+            attn_metadata,
+            start_req=0,
+            num_group_reqs=num_decode_reqs,
+            num_group_tokens=num_decode_tokens,
+            max_reqs=self.max_num_reqs,
+            max_tokens=decode_ctx.max_tokens,
+        )
+        prefill_attn_metadata = self._build_group_attention_metadata(
+            attn_metadata,
+            start_req=num_decode_reqs,
+            num_group_reqs=num_prefill_reqs,
+            num_group_tokens=num_prefill_tokens,
+            max_reqs=self.max_num_reqs,
+            max_tokens=prefill_ctx.max_tokens,
+        )
+
+        self._pd_manager.run(prefill_attn_metadata, decode_attn_metadata)
 
         # Read back the two outputs and concatenate them in decode-first order.
         # The graphs replay to their full static shape, so slice each output
@@ -406,6 +474,89 @@ class PDDualStreamModelRunner(NPUModelRunner):
         decode_out = decode_out[:num_decode_tokens]
         prefill_out = prefill_out[:num_prefill_tokens]
         return torch.cat([decode_out, prefill_out], dim=0)
+
+    def _build_group_attention_metadata(
+        self,
+        attn_metadata: dict[str, AscendMetadata],
+        start_req: int,
+        num_group_reqs: int,
+        num_group_tokens: int,
+        max_reqs: int,
+        max_tokens: int,
+    ) -> dict[str, AscendMetadata]:
+        """Rebase/pad a slice of the combined metadata to a group's static shape.
+
+        The combined metadata is already decode-first after
+        :meth:`_reorder_decode_first`, so the decode group is ``[0, num_decode_reqs)``
+        and the prefill group is ``[num_decode_reqs, num_decode_reqs + num_prefill_reqs)``.
+        ``seq_lens`` / ``seq_lens_list`` / ``block_tables`` are per-request and can be
+        sliced directly; ``actual_seq_lengths_q`` is a cumulative prefix-sum and is
+        rebased so it starts at 0 for the group.
+        """
+        group_metadata: dict[str, AscendMetadata] = {}
+        for layer_name, meta in attn_metadata.items():
+            if meta is None or meta.seq_lens is None or meta.block_tables is None:
+                continue
+
+            seq_lens = meta.seq_lens[start_req : start_req + num_group_reqs]
+            seq_lens_list = meta.seq_lens_list[start_req : start_req + num_group_reqs]
+            block_tables = meta.block_tables[start_req : start_req + num_group_reqs]
+
+            base = int(meta.actual_seq_lengths_q[start_req - 1]) if start_req > 0 else 0
+            real_cumulative = [
+                int(v) - base
+                for v in meta.actual_seq_lengths_q[start_req : start_req + num_group_reqs]
+            ]
+
+            group_metadata[layer_name] = dataclasses.replace(
+                meta,
+                seq_lens=self._pad_1d_tensor(seq_lens, max_reqs),
+                seq_lens_list=list(seq_lens_list) + [0] * (max_reqs - num_group_reqs),
+                actual_seq_lengths_q=self._pad_cumulative_query_lens(
+                    real_cumulative, num_group_tokens, max_reqs, max_tokens
+                ),
+                block_tables=self._pad_block_tables(block_tables, max_reqs),
+            )
+        return group_metadata
+
+    @staticmethod
+    def _pad_1d_tensor(tensor: torch.Tensor, max_reqs: int) -> torch.Tensor:
+        padded = torch.zeros(max_reqs, dtype=tensor.dtype, device=tensor.device)
+        padded[: tensor.shape[0]] = tensor
+        return padded
+
+    @staticmethod
+    def _pad_block_tables(block_tables: torch.Tensor, max_reqs: int) -> torch.Tensor:
+        num_group_reqs = block_tables.shape[0]
+        max_blocks = block_tables.shape[1]
+        padded = torch.zeros(
+            (max_reqs, max_blocks), dtype=block_tables.dtype, device=block_tables.device
+        )
+        padded[:num_group_reqs] = block_tables
+        return padded
+
+    @staticmethod
+    def _pad_cumulative_query_lens(
+        real_cumulative: list[int],
+        num_group_tokens: int,
+        max_reqs: int,
+        max_tokens: int,
+    ) -> list[int]:
+        """Pad a group's cumulative query lengths to the graph's static shape.
+
+        The group's ``actual_seq_lengths_q`` is a prefix-sum ending at
+        ``num_group_tokens``.  The captured graph replays with a fixed
+        ``max_tokens``-row query, so the list must end at ``max_tokens``.  When a
+        free request slot exists we absorb the residual ``max_tokens - num_group_tokens``
+        into one zero-context padding request; when the group already fills every
+        slot the residual is left unabsorbed (documented on-device validation case).
+        """
+        padded = list(real_cumulative)
+        if len(padded) < max_reqs:
+            padded.append(max_tokens)
+        while len(padded) < max_reqs:
+            padded.append(max_tokens)
+        return padded
 
     @staticmethod
     def _stage_static_inputs(ctx, input_ids: torch.Tensor, positions: torch.Tensor) -> None:
@@ -422,6 +573,35 @@ class PDDualStreamModelRunner(NPUModelRunner):
         ctx.static_positions.zero_()
         ctx.static_input_ids[:num_tokens].copy_(input_ids, non_blocking=True)
         ctx.static_positions[:num_tokens].copy_(positions, non_blocking=True)
+
+    @staticmethod
+    def _get_combined_slot_mapping(attn_metadata: dict[str, AscendMetadata]) -> torch.Tensor:
+        """Return the combined (decode-first) slot_mapping tensor.
+
+        All layers in the single kv-cache group share the same
+        ``AscendMetadata`` instance (and therefore the same slot_mapping), so
+        the first non-None entry is authoritative.
+        """
+        for meta in attn_metadata.values():
+            if meta is not None and meta.slot_mapping is not None:
+                return meta.slot_mapping
+        raise RuntimeError(
+            "PD dual-stream requires a slot_mapping tensor in attention metadata"
+        )
+
+    @staticmethod
+    def _stage_static_slot_mapping(ctx, slot_mapping: torch.Tensor) -> None:
+        """Copy a group's slot_mapping into its private static buffer.
+
+        The actual slots are front-packed and the tail is filled with -1
+        (PAD_SLOT_ID), so the padded tokens of the static graph write no KV.
+        This runs on the default stream before replay; each replay stream waits
+        on the default stream (see ``PDDualStreamGraphManager.run``), so the
+        copy is visible to the replayed ``reshape_and_cache`` op.
+        """
+        num_tokens = slot_mapping.shape[0]
+        ctx.static_slot_mapping.fill_(-1)
+        ctx.static_slot_mapping[:num_tokens].copy_(slot_mapping, non_blocking=True)
 
     # ------------------------------------------------------------------ #
     # Sample

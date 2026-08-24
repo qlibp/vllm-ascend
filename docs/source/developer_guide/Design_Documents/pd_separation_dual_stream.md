@@ -214,10 +214,16 @@ partition.
 * The static prefill/decode graphs capture a fixed batch shape
   (`MAX_PREFILL_TOKENS` / `MAX_DECODE_TOKENS`). A prefill request larger than the
   static prefill batch is *not* chunked — it waits for a step where it fits.
-* **Per-group attention-metadata refresh is the remaining integration point
-  (not yet resolved).** The graphs are captured with *dummy* attention metadata
-  (block tables / slot mappings / sequence lengths). Before each replay those
-  per-group attention params must be refreshed into the graph workspaces for
-  the actual requests; until then the graphs compute against stale kv-cache
-  addresses. This is flagged `TODO(remote-validate)` in
-  `model_runner_pd.py::_run_dual_stream` and must be validated on the NPU.
+* **Per-group attention-metadata refresh is implemented but must be validated
+  on the NPU.** The two graphs are captured with `_EXTRA_CTX.capturing=True` and
+  a global `set_graph_params([MAX_PREFILL_TOKENS, MAX_DECODE_TOKENS])` so each
+  attention op records an updatable task group. Before every replay
+  `PDDualStreamGraphManager.run` re-binds the actual per-group seq_lens /
+  block_tables / query-lengths into each graph via
+  `update_full_graph_params` on that graph's `update_stream`, then the replay
+  stream `wait_stream`s the update stream. Per-group metadata is built by
+  slicing the combined (decode-first) metadata and front-packing/zero-padding it
+  to the graphs' static shapes. The padding semantics (one zero-context request
+  absorbing the static token slack, the group-fills-every-slot residual, and
+  empty-group replay) still need on-device tuning; see
+  `model_runner_pd.py::_pad_cumulative_query_lens`.

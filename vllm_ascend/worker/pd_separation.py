@@ -52,11 +52,21 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch_npu
 
+from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
+
+from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.compilation.acl_graph import (
+    reset_graph_params,
+    set_graph_params,
+    update_full_graph_params,
+)
 
 logger = init_logger(__name__)
 
@@ -151,6 +161,10 @@ class PDStreamContext:
         # dedicated capture stream separate from the replay stream so that
         # capture never interferes with a stream the scheduler is using.
         self.capture_stream = torch.npu.Stream(device=device)
+        # Side stream on which the attention task-group params are refreshed
+        # (``graph_task_update_begin/end``).  The replay stream waits on it
+        # before every replay so the updated params are visible.
+        self.update_stream = torch.npu.Stream(device=device)
         self.cube_num = cube_num
         self.vector_num = vector_num
 
@@ -168,6 +182,13 @@ class PDStreamContext:
         # tail zero-padded) before replay.  input_ids is int32, positions int64.
         self.static_input_ids = torch.zeros(max_tokens, dtype=torch.int32, device=device)
         self.static_positions = torch.zeros(max_tokens, dtype=torch.int64, device=device)
+        # KV-write slot_mapping.  reshape_and_cache is a *plain* captured op
+        # that reads the baked address on replay (it is not part of the FIA
+        # task-group update path), so each stream needs its own private buffer
+        # that the runner re-stages before every replay.  Keeping one buffer
+        # per stream is what stops the prefill and decode graphs from reading
+        # each other's slots.
+        self.static_slot_mapping = torch.zeros(max_tokens, dtype=torch.int64, device=device)
 
         # Populated by ``PDDualStreamGraphManager.capture``.
         self.graph: torch.npu.NPUGraph | None = None
@@ -212,9 +233,13 @@ class PDDualStreamGraphManager:
         device: torch.device,
         prefill_tokens: int,
         decode_tokens: int,
+        attn_backend: Any,
+        vllm_config: VllmConfig,
     ) -> None:
         self.config = config
         self.device = device
+        self.attn_backend = attn_backend
+        self.vllm_config = vllm_config
         self.default_stream = torch.npu.default_stream(device)
         self.prefill_ctx = PDStreamContext(
             "prefill",
@@ -253,6 +278,14 @@ class PDDualStreamGraphManager:
         if self.is_captured:
             raise RuntimeError("PD dual-stream graphs have already been captured")
 
+        # The attention ops record updatable task groups into the *global*
+        # graph params (see AscendAttentionBackendImpl.full_graph_* and
+        # update_full_graph_params).  Both static graphs must therefore be
+        # registered before either capture callback runs, keyed by their static
+        # token counts.
+        reset_graph_params()
+        set_graph_params(sorted({self.prefill_ctx.max_tokens, self.decode_ctx.max_tokens}))
+
         self.prefill_ctx.graph = torch.npu.NPUGraph()
         with torch.npu.graph(self.prefill_ctx.graph, stream=self.prefill_ctx.capture_stream):
             self.prefill_ctx.output = prefill_capture_fn(
@@ -274,8 +307,18 @@ class PDDualStreamGraphManager:
         # One-time barrier after capture (not on the replay hot path).
         torch.npu.synchronize()
 
-    def run(self) -> None:
-        """Concurrently replay both graphs on their two streams.
+    def run(
+        self,
+        prefill_attn_metadata: Any,
+        decode_attn_metadata: Any,
+    ) -> None:
+        """Refresh per-group attention params and concurrently replay both graphs.
+
+        ``prefill_attn_metadata`` / ``decode_attn_metadata`` are the static-
+        shaped per-layer attention metadata for the *actual* requests of this
+        step (front-packed and zero-padded to the graphs' capture shapes).  They
+        are refreshed into the two graphs' task groups on each context's
+        ``update_stream`` immediately before replay.
 
         The host engine loop is synchronous (one ``run`` per step), so the two
         replay streams are the only concurrency: they interleave their kernels
@@ -292,6 +335,13 @@ class PDDualStreamGraphManager:
         decode_graph = decode_ctx.graph
         assert prefill_graph is not None and decode_graph is not None
 
+        # Refresh each graph's attention task-group params on its update stream.
+        # This re-binds seq_lens / block_tables / query lengths for the actual
+        # requests; without it the graphs would compute against the dummy
+        # metadata captured at startup.
+        self._update_attention_metadata(prefill_ctx, prefill_attn_metadata)
+        self._update_attention_metadata(decode_ctx, decode_attn_metadata)
+
         # Cross-step P->D handoff: this step's decode stream must not start
         # until the *previous* step's prefill completed -- a request that just
         # prefilled now enters decode and its kv-cache writes must be visible.
@@ -303,15 +353,18 @@ class PDDualStreamGraphManager:
                 decode_ctx.stream.wait_event(prefill_ctx.done_event)
 
         # Concurrent replay.  Each stream first waits on the default stream so
-        # the host->device copies of its static input buffers are visible, then
-        # replays and immediately records its done event.  No device-level
+        # the host->device copies of its static input buffers are visible, and
+        # on its update stream so the refreshed attention params are visible,
+        # then replays and immediately records its done event.  No device-level
         # synchronize() anywhere on this hot path.
         with torch.npu.stream(prefill_ctx.stream):
             prefill_ctx.stream.wait_stream(self.default_stream)
+            prefill_ctx.stream.wait_stream(prefill_ctx.update_stream)
             prefill_graph.replay()
             prefill_ctx.done_event.record()
         with torch.npu.stream(decode_ctx.stream):
             decode_ctx.stream.wait_stream(self.default_stream)
+            decode_ctx.stream.wait_stream(decode_ctx.update_stream)
             decode_graph.replay()
             decode_ctx.done_event.record()
 
@@ -321,3 +374,35 @@ class PDDualStreamGraphManager:
         self.default_stream.wait_event(decode_ctx.done_event)
 
         self._has_run = True
+
+    def _update_attention_metadata(self, ctx: "PDStreamContext", attn_metadata: Any) -> None:
+        """Refresh one graph's attention task groups for the current step.
+
+        ``update_full_graph_params`` re-issues the per-layer attention op with
+        ``graph_task_update_begin/end`` on ``ctx.update_stream`` using the
+        actual per-layer metadata, re-binding the seq_lens / block_tables /
+        query-lengths that were baked into the graph at capture time.
+        """
+        if not attn_metadata:
+            # A graph whose group is empty this step still needs no refresh:
+            # its padded metadata keeps zero seq_lens / zero block tables and
+            # the replay output is sliced away by the caller.
+            return
+        with set_ascend_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=ctx.max_tokens,
+            num_tokens_across_dp=None,
+            aclgraph_runtime_mode=CUDAGraphMode.NONE,
+            batch_descriptor=BatchDescriptor(num_tokens=ctx.max_tokens),
+            num_actual_tokens=ctx.max_tokens,
+            model_instance=None,
+        ):
+            forward_context = get_forward_context()
+            update_full_graph_params(
+                self.attn_backend,
+                ctx.update_stream,
+                forward_context,
+                ctx.max_tokens,
+                self.vllm_config,
+            )
