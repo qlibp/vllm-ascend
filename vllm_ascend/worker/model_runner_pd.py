@@ -210,6 +210,7 @@ class PDDualStreamModelRunner(NPUModelRunner):
         num_scheduled_tokens_list[-1] += remainder
         return np.array(num_scheduled_tokens_list, dtype=np.int32)
 
+    @torch.inference_mode()
     def _forward_for_capture(
         self,
         num_tokens: int,
