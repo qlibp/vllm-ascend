@@ -40,7 +40,9 @@ Core invariants (do not break these):
    buffers are visible; each stream records a fresh ``done_event`` immediately
    after replay; the default stream ``wait_event``s both done events before
    reading logits.  ``torch.npu.synchronize()`` is called *only* once, after
-   capture.
+   capture.  A per-stream host ``stream.synchronize()`` is issued before each
+   context's attention-param update (see invariant 6): it is a stream-level
+   host wait, not a device-wide barrier, and is required for async scheduling.
 5. **The single cross-stream dependency is the cross-step P->D handoff, and it
    is transitively covered by ``wait_stream(default)``.**  Step N's default
    stream waits on step N's prefill ``done_event`` before any logits/sampling
@@ -49,7 +51,15 @@ Core invariants (do not break these):
    not wait directly on the previous step's event: re-recording an event while
    another stream may still be waiting on it is unsafe on NPU.  Within a step
    the two streams never wait on each other.
-6. **``set_stream_limit`` is applied only when enabled** (non-negative cube/vec
+6. **Same-context update and replay are serialized across steps.**  The
+   attention task-group params (``graph_params.events`` / handles) are
+   single-buffered and re-recorded on each step's update.  With async
+   scheduling the host may enqueue step N+1's update while step N's replay is
+   still consuming those params; re-recording them while the graph waits on
+   them is unsafe on NPU.  Before each ``_update_attention_metadata`` we
+   therefore ``stream.synchronize()`` on that context's replay stream, so the
+   previous replay (and the update work it waited on) has completed.
+7. **``set_stream_limit`` is applied only when enabled** (non-negative cube/vec
    counts), once per stream after capture.
 """
 
@@ -360,12 +370,23 @@ class PDDualStreamGraphManager:
             bool(decode_attn_metadata),
         )
 
+        # Serialize this context's update with its previous replay.  The
+        # attention task-group params (graph_params.events / handles) are
+        # single-buffered and re-recorded below; under async scheduling the host
+        # may reach this point while the previous step's replay on ``ctx.stream``
+        # is still consuming the previous update.  ``stream.synchronize()`` is a
+        # stream-level host wait (not a device-wide barrier) and ensures the
+        # previous replay, and the update work it waited on, have both finished
+        # before we re-record those params.  See module docstring invariant 6.
+        prefill_ctx.stream.synchronize()
         # Refresh each graph's attention task-group params on its update stream.
         # This re-binds seq_lens / block_tables / query lengths for the actual
         # requests; without it the graphs would compute against the dummy
         # metadata captured at startup.
         self._update_attention_metadata(prefill_ctx, prefill_attn_metadata)
         logger.info("[lqf] PDDualStreamGraphManager.run prefill metadata updated")
+
+        decode_ctx.stream.synchronize()
         self._update_attention_metadata(decode_ctx, decode_attn_metadata)
         logger.info("[lqf] PDDualStreamGraphManager.run decode metadata updated")
 
