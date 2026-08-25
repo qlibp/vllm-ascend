@@ -949,17 +949,22 @@ class NPUWorker(WorkerBase):
         if is_start:
             from vllm.distributed.utils import get_worker_rank_suffix
 
+            logger.info("PD-DEBUG profile(is_start=True) begin")
             rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
             trace_name = f"{profile_prefix}_{rank_suffix}" if profile_prefix else rank_suffix
 
             if self.profiler is None:
+                logger.info("PD-DEBUG constructing TorchNPUProfilerWrapper")
                 self.profiler = TorchNPUProfilerWrapper(self.profiler_config, trace_name)
-                logger.debug("Starting torch profiler with trace name: %s", trace_name)
+                logger.info("PD-DEBUG TorchNPUProfilerWrapper constructed, calling start()")
                 self.profiler.start()  # type: ignore[attr-defined]
+                logger.info("PD-DEBUG start() returned")
             else:
                 # Profiler already initialized. Restart profiling but keep
                 # the original trace name from the first initialization.
+                logger.info("PD-DEBUG reusing existing TorchNPUProfilerWrapper, calling start()")
                 self.profiler.start()
+                logger.info("PD-DEBUG start() returned (reuse)")
         else:
             if self.profiler is None:
                 logger.warning("Profiler was not started, nothing to stop.")

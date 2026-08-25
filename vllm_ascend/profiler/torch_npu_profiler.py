@@ -21,21 +21,28 @@ from typing import Any
 
 import torch_npu
 from vllm.config import ProfilerConfig
+from vllm.logger import init_logger
 from vllm.profiler.wrapper import WorkerProfiler
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
+
+logger = init_logger(__name__)
 
 
 class TorchNPUProfilerWrapper(WorkerProfiler):
     """Subclass of vLLM ``WorkerProfiler`` that wires in ``torch_npu.profiler``."""
 
     def __init__(self, profiler_config: ProfilerConfig, trace_name: str) -> None:
+        logger.info("PD-DEBUG TorchNPUProfilerWrapper.__init__ begin")
         super().__init__(profiler_config)
+        logger.info("PD-DEBUG before _create_profiler")
         self.profiler: Any = self._create_profiler(profiler_config, trace_name)
+        logger.info("PD-DEBUG _create_profiler returned")
 
     @staticmethod
     def _create_profiler(profiler_config: ProfilerConfig, trace_name: str) -> Any:
+        logger.info("PD-DEBUG _create_profiler begin")
         if profiler_config.profiler != "torch":
             raise RuntimeError(f"Unrecognized profiler: {profiler_config.profiler}")
         if not profiler_config.torch_profiler_dir:
@@ -46,6 +53,7 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
         if msmonitor_use_daemon:
             raise RuntimeError("MSMONITOR_USE_DAEMON and torch profiler cannot be both enabled at the same time.")
 
+        logger.info("PD-DEBUG before _ExperimentalConfig")
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             export_type=torch_npu.profiler.ExportType.Text,
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
@@ -58,7 +66,13 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
             gc_detect_threshold=None,
         )
 
-        return torch_npu.profiler.profile(
+        logger.info("PD-DEBUG before tensorboard_trace_handler")
+        trace_handler = torch_npu.profiler.tensorboard_trace_handler(
+            profiler_config.torch_profiler_dir,
+            worker_name=trace_name,
+        )
+        logger.info("PD-DEBUG before torch_npu.profiler.profile")
+        profiler = torch_npu.profiler.profile(
             activities=[
                 torch_npu.profiler.ProfilerActivity.CPU,
                 torch_npu.profiler.ProfilerActivity.NPU,
@@ -69,14 +83,15 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
             # The with_stack option in torch_npu.profiler introduces significant time overhead.
             with_modules=profiler_config.torch_profiler_with_stack,
             experimental_config=experimental_config,
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                profiler_config.torch_profiler_dir,
-                worker_name=trace_name,
-            ),
+            on_trace_ready=trace_handler,
         )
+        logger.info("PD-DEBUG torch_npu.profiler.profile returned")
+        return profiler
 
     def _start(self) -> None:
+        logger.info("PD-DEBUG _start begin")
         self.profiler.start()
+        logger.info("PD-DEBUG _start end")
 
     def _stop(self) -> None:
         self.profiler.stop()
