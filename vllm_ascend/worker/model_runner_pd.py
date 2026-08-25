@@ -510,7 +510,17 @@ class PDDualStreamModelRunner(NPUModelRunner):
             max_tokens=prefill_ctx.max_tokens,
         )
 
+        logger.info(
+            "[lqf] _run_dual_stream before manager.run "
+            "num_decode_reqs=%s num_prefill_reqs=%s "
+            "num_decode_tokens=%s num_prefill_tokens=%s",
+            num_decode_reqs,
+            num_prefill_reqs,
+            num_decode_tokens,
+            num_prefill_tokens,
+        )
         self._pd_manager.run(prefill_attn_metadata, decode_attn_metadata)
+        logger.info("[lqf] _run_dual_stream after manager.run")
 
         # Read back the two outputs and concatenate them in decode-first order.
         # The graphs replay to their full static shape, so slice each output
@@ -675,7 +685,12 @@ class PDDualStreamModelRunner(NPUModelRunner):
         ) = self.execute_model_state
         self.execute_model_state = None
 
+        logger.info(
+            "[lqf] sample_tokens before _sample total_tokens=%s",
+            scheduler_output.total_num_scheduled_tokens,
+        )
         sampler_output = self._sample(logits, spec_decode_metadata)
+        logger.info("[lqf] sample_tokens after _sample")
 
         (
             logprobs_lists,
@@ -703,6 +718,8 @@ class PDDualStreamModelRunner(NPUModelRunner):
             cudagraph_stats=cudagraph_stats,
         )
 
+        logger.info("[lqf] sample_tokens after _bookkeeping_sync")
+
         if not self.use_async_scheduling:
             return model_runner_output
 
@@ -720,8 +737,10 @@ class PDDualStreamModelRunner(NPUModelRunner):
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
         )
+        logger.info("[lqf] sample_tokens created AsyncGPUModelRunnerOutput")
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
+        logger.info("[lqf] sample_tokens returning async output")
         return async_output

@@ -37,13 +37,18 @@ Core invariants (do not break these):
    the outer capture records the eager forward.
 4. **Event-level sync, no device barrier on the hot path.**  Before replay each
    stream ``wait_stream(default)`` so the host->device copies of the static
-   buffers are visible; each stream records a ``done_event`` immediately after
-   replay; the default stream ``wait_event``s both done events before reading
-   logits.  ``torch.npu.synchronize()`` is called *only* once, after capture.
-5. **The single cross-stream dependency is the cross-step P->D handoff.**  Step
-   N+1's decode stream ``wait_event``s step N's prefill ``done_event`` (a
-   request that just prefilled now enters decode and its kv-cache must be
-   visible).  Within a step the two streams never wait on each other.
+   buffers are visible; each stream records a fresh ``done_event`` immediately
+   after replay; the default stream ``wait_event``s both done events before
+   reading logits.  ``torch.npu.synchronize()`` is called *only* once, after
+   capture.
+5. **The single cross-stream dependency is the cross-step P->D handoff, and it
+   is transitively covered by ``wait_stream(default)``.**  Step N's default
+   stream waits on step N's prefill ``done_event`` before any logits/sampling
+   work, so step N+1's decode stream ``wait_stream(default)`` ensures a request
+   that just prefilled and now enters decode sees its kv-cache writes.  We do
+   not wait directly on the previous step's event: re-recording an event while
+   another stream may still be waiting on it is unsafe on NPU.  Within a step
+   the two streams never wait on each other.
 6. **``set_stream_limit`` is applied only when enabled** (non-negative cube/vec
    counts), once per stream after capture.
 """
@@ -168,14 +173,14 @@ class PDStreamContext:
         self.cube_num = cube_num
         self.vector_num = vector_num
 
-        # Done event: recorded on ``self.stream`` immediately after replay and
-        # waited on by (a) the default stream for readback and (b), for the
-        # prefill stream only, by the *next* step's decode stream (cross-step
-        # P->D handoff).  It is persistent across steps; re-recording is safe
-        # because each replay stream ``wait_stream(default)`` before replay,
-        # which orders the re-record after the previous step's default-stream
-        # reads (including the previous ``wait_event`` on this event).
+        # Done events: two event objects swapped after each step.  The current
+        # step records ``_spare_done_event`` and the default stream waits on it
+        # for readback; the other slot (``done_event``) holds the previous
+        # step's recorded event until it is safe to reuse.  This avoids
+        # re-recording an event while the default stream may still be waiting
+        # on the previous record, which is unsafe on NPU.
         self.done_event = torch.npu.Event()
+        self._spare_done_event = torch.npu.Event()
 
         # Static input tensors whose *addresses* are baked into the graph.  The
         # runner copies the current step's values into these (front-packed,
@@ -260,9 +265,6 @@ class PDDualStreamGraphManager:
             config.decode_vector_num,
             max_tokens=decode_tokens,
         )
-        # Cross-step handoff guard: the very first step has no previous prefill
-        # to wait on.
-        self._has_run = False
 
     @property
     def is_captured(self) -> bool:
@@ -340,45 +342,80 @@ class PDDualStreamGraphManager:
         decode_graph = decode_ctx.graph
         assert prefill_graph is not None and decode_graph is not None
 
+        # The event objects recorded in this step.  The spare event is what this
+        # step records and the default stream waits on; the other slot
+        # (``done_event``) is the previous step's recorded event, which stays
+        # untouched until it is safe to reuse.  This prevents us from re-recording
+        # an event while another stream might still be waiting on it.
+        prefill_done_event = prefill_ctx._spare_done_event
+        decode_done_event = decode_ctx._spare_done_event
+
+        logger.info(
+            "[lqf] PDDualStreamGraphManager.run enter "
+            "prefill_max_tokens=%s decode_max_tokens=%s "
+            "prefill_attn_metadata=%s decode_attn_metadata=%s",
+            prefill_ctx.max_tokens,
+            decode_ctx.max_tokens,
+            bool(prefill_attn_metadata),
+            bool(decode_attn_metadata),
+        )
+
         # Refresh each graph's attention task-group params on its update stream.
         # This re-binds seq_lens / block_tables / query lengths for the actual
         # requests; without it the graphs would compute against the dummy
         # metadata captured at startup.
         self._update_attention_metadata(prefill_ctx, prefill_attn_metadata)
+        logger.info("[lqf] PDDualStreamGraphManager.run prefill metadata updated")
         self._update_attention_metadata(decode_ctx, decode_attn_metadata)
-
-        # Cross-step P->D handoff: this step's decode stream must not start
-        # until the *previous* step's prefill completed -- a request that just
-        # prefilled now enters decode and its kv-cache writes must be visible.
-        # This is the single cross-stream dependency; ``wait_stream(default)``
-        # below would also transitively cover it, but we spell it out so the
-        # handoff stays explicit if the default-stream join is ever relaxed.
-        if self._has_run:
-            with torch.npu.stream(decode_ctx.stream):
-                decode_ctx.stream.wait_event(prefill_ctx.done_event)
+        logger.info("[lqf] PDDualStreamGraphManager.run decode metadata updated")
 
         # Concurrent replay.  Each stream first waits on the default stream so
         # the host->device copies of its static input buffers are visible, and
         # on its update stream so the refreshed attention params are visible,
         # then replays and immediately records its done event.  No device-level
         # synchronize() anywhere on this hot path.
+        #
+        # The cross-step P->D handoff is covered by
+        # ``decode_ctx.stream.wait_stream(self.default_stream)`` below: step N's
+        # default stream already waits on step N's prefill ``done_event`` before
+        # any logits/sampling work, so a later decode stream that waits on the
+        # default stream transitively waits for step N's prefill kv-cache writes.
+        # We deliberately do NOT wait directly on the previous step's event; that
+        # would require re-using an event object while another stream may still
+        # be waiting on it, which is unsafe on NPU.
         with torch.npu.stream(prefill_ctx.stream):
             prefill_ctx.stream.wait_stream(self.default_stream)
             prefill_ctx.stream.wait_stream(prefill_ctx.update_stream)
             prefill_graph.replay()
-            prefill_ctx.done_event.record()
+            prefill_done_event.record()
+        logger.info("[lqf] PDDualStreamGraphManager.run prefill replay + done_event enqueued")
         with torch.npu.stream(decode_ctx.stream):
             decode_ctx.stream.wait_stream(self.default_stream)
             decode_ctx.stream.wait_stream(decode_ctx.update_stream)
             decode_graph.replay()
-            decode_ctx.done_event.record()
+            decode_done_event.record()
+        logger.info("[lqf] PDDualStreamGraphManager.run decode replay + done_event enqueued")
 
         # Readback: the default stream reads both outputs for logits/sampling,
         # so it waits on each graph's done event (event-level, not a barrier).
-        self.default_stream.wait_event(prefill_ctx.done_event)
-        self.default_stream.wait_event(decode_ctx.done_event)
+        self.default_stream.wait_event(prefill_done_event)
+        self.default_stream.wait_event(decode_done_event)
+        logger.info("[lqf] PDDualStreamGraphManager.run default-stream wait events enqueued")
 
-        self._has_run = True
+        # Swap the event objects so the event just recorded becomes the previous
+        # event for the next step, and the older event becomes the spare to be
+        # recorded next step.  With max_concurrent_batches == 2 this guarantees
+        # the spare event has no remaining waiters when it is recorded again.
+        prefill_ctx.done_event, prefill_ctx._spare_done_event = (
+            prefill_ctx._spare_done_event,
+            prefill_ctx.done_event,
+        )
+        decode_ctx.done_event, decode_ctx._spare_done_event = (
+            decode_ctx._spare_done_event,
+            decode_ctx.done_event,
+        )
+
+        logger.info("[lqf] PDDualStreamGraphManager.run exit")
 
     def _update_attention_metadata(self, ctx: "PDStreamContext", attn_metadata: Any) -> None:
         """Refresh one graph's attention task groups for the current step.
