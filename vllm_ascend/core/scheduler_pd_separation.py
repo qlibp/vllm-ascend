@@ -246,6 +246,21 @@ class SchedulerPDSeparation(Scheduler):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            logger.info(
+                "[lqf] schedule RUNNING request_id=%s phase=%s "
+                "num_new_tokens=%s num_computed_tokens=%s num_tokens=%s "
+                "num_prompt_tokens=%s num_output_tokens=%s "
+                "num_output_placeholders=%s is_prefill_chunk=%s",
+                request.request_id,
+                "decode" if request.num_computed_tokens >= request.num_prompt_tokens else "prefill",
+                num_new_tokens,
+                request.num_computed_tokens,
+                request.num_tokens,
+                request.num_prompt_tokens,
+                request.num_output_tokens,
+                request.num_output_placeholders,
+                request.is_prefill_chunk,
+            )
             req_index += 1
 
             # Speculative decode related.
@@ -434,6 +449,19 @@ class SchedulerPDSeparation(Scheduler):
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                logger.info(
+                    "[lqf] schedule WAITING/PREEMPTED request_id=%s status=%s "
+                    "num_new_tokens=%s num_computed_tokens=%s "
+                    "num_prompt_tokens=%s num_tokens=%s "
+                    "num_output_placeholders=%s",
+                    request.request_id,
+                    request.status,
+                    num_new_tokens,
+                    num_computed_tokens,
+                    request.num_prompt_tokens,
+                    request.num_tokens,
+                    request.num_output_placeholders,
+                )
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if encoder_inputs_to_schedule:
