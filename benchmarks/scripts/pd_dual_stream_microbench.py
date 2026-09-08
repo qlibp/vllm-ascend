@@ -20,8 +20,13 @@ monotonic integers; only the compute amount (num prefill tokens, num decode
 tokens, num requests) matches the target scenario.
 
 Usage:
-    VLLM_ASCEND_ENABLE_PD_SEPARATION=0 python benchmarks/scripts/pd_dual_stream_microbench.py \
-        --model <model> --profile --profile-dir /tmp/pd_traces
+    # Recommended: run each scenario in its own process (clean device state).
+    python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode baseline
+    python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode pd
+
+    # Or run both back-to-back in one process (needs ~2x device memory).
+    python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode both \
+        --profile --profile-dir /tmp/pd_traces
 """
 
 from __future__ import annotations
@@ -458,6 +463,16 @@ def measure_scenario(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="HuggingFace model id or path")
+    parser.add_argument(
+        "--mode",
+        choices=["baseline", "pd", "both"],
+        default="both",
+        help=(
+            "Which scenario to run. 'baseline' and 'pd' run a single scenario in "
+            "this process (recommended for clean memory/device state); 'both' runs "
+            "the two scenarios back-to-back in one process for a direct comparison."
+        ),
+    )
     parser.add_argument("--prefill-len", type=int, default=200)
     parser.add_argument("--beam-width", type=int, default=128)
     parser.add_argument("--output-tokens", type=int, default=2)
@@ -498,90 +513,96 @@ def main() -> None:
         default_mnt if args.max_num_batched_tokens is None else args.max_num_batched_tokens
     )
 
-    print("== Building baseline worker (native chunked prefill) ==")
-    baseline_worker = build_worker(
-        args.model,
-        max_num_batched_tokens=max_num_batched_tokens,
-        max_num_seqs=args.max_num_seqs,
-        enable_pd=False,
-        block_size=args.block_size,
-        max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=args.enforce_eager,
-        profiler_config=profiler_config,
-    )
-    baseline_runner = baseline_worker.model_runner
+    mode = args.mode
 
-    print("== Building PD worker (P/D dual-stream) ==")
-    pd_worker = build_worker(
-        args.model,
-        max_num_batched_tokens=max_num_batched_tokens,
-        max_num_seqs=args.max_num_seqs,
-        enable_pd=True,
-        block_size=args.block_size,
-        max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=args.enforce_eager,
-        profiler_config=profiler_config,
-    )
-    pd_runner = pd_worker.model_runner
+    if mode in ("baseline", "both"):
+        print("== Building baseline worker (native chunked prefill) ==")
+        baseline_worker = build_worker(
+            args.model,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            enable_pd=False,
+            block_size=args.block_size,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=args.enforce_eager,
+            profiler_config=profiler_config,
+        )
+        baseline_runner = baseline_worker.model_runner
 
-    baseline_steps, baseline_reset = build_baseline_steps(
-        baseline_runner, P, B, D, args.chunk_size, sampling_params, args.block_size
-    )
-    pd_steps, pd_reset = build_pd_steps(
-        pd_runner, P, B, D, sampling_params, args.block_size
-    )
+        baseline_steps, baseline_reset = build_baseline_steps(
+            baseline_runner, P, B, D, args.chunk_size, sampling_params, args.block_size
+        )
 
-    print("\n== Baseline (chunked prefill) ==")
-    baseline_result = measure_scenario(
-        baseline_runner,
-        baseline_steps,
-        baseline_reset,
-        args.warmup,
-        args.iters,
-        args.profile,
-        baseline_worker,
-        "baseline",
-    )
-    print(baseline_result)
+        print("\n== Baseline (chunked prefill) ==")
+        baseline_result = measure_scenario(
+            baseline_runner,
+            baseline_steps,
+            baseline_reset,
+            args.warmup,
+            args.iters,
+            args.profile,
+            baseline_worker,
+            "baseline",
+        )
+        print(baseline_result)
 
-    print("\n== PD dual-stream ==")
-    pd_result = measure_scenario(
-        pd_runner,
-        pd_steps,
-        pd_reset,
-        args.warmup,
-        args.iters,
-        args.profile,
-        pd_worker,
-        "pd",
-    )
-    print(pd_result)
+    if mode in ("pd", "both"):
+        print("== Building PD worker (P/D dual-stream) ==")
+        pd_worker = build_worker(
+            args.model,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            enable_pd=True,
+            block_size=args.block_size,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=args.enforce_eager,
+            profiler_config=profiler_config,
+        )
+        pd_runner = pd_worker.model_runner
 
-    print("\n== Summary ==")
+        pd_steps, pd_reset = build_pd_steps(
+            pd_runner, P, B, D, sampling_params, args.block_size
+        )
 
-    # Baseline step layout: [prefill chunk0..k-1, decode1, decode2, ...]
-    n_prefill_steps = _cdiv(P, args.chunk_size)
-    baseline_prefill = sum(
-        baseline_result[f"step{i}_mean_ms"] for i in range(n_prefill_steps)
-    )
-    baseline_decode1 = baseline_result[f"step{n_prefill_steps}_mean_ms"]
-    baseline_prefill_plus_decode = baseline_prefill + baseline_decode1
+        print("\n== PD dual-stream ==")
+        pd_result = measure_scenario(
+            pd_runner,
+            pd_steps,
+            pd_reset,
+            args.warmup,
+            args.iters,
+            args.profile,
+            pd_worker,
+            "pd",
+        )
+        print(pd_result)
 
-    # PD step layout: [pioneer prefill, dual-stream1, dual-stream2, ...]
-    pd_prefill_only = pd_result["step0_mean_ms"]
-    pd_dual_stream = pd_result["step1_mean_ms"]
+    if mode == "both":
+        print("\n== Summary ==")
 
-    print(f"baseline prefill(200, chunked)        : {baseline_prefill:.3f} ms")
-    print(f"baseline decode step (128 beams)      : {baseline_decode1:.3f} ms")
-    print(f"baseline prefill+decode (sequential)  : {baseline_prefill_plus_decode:.3f} ms")
-    print(f"pd       prefill-only (200)           : {pd_prefill_only:.3f} ms")
-    print(f"pd       dual-stream step (P+D overlap): {pd_dual_stream:.3f} ms")
-    print(
-        f"speedup vs sequential                 : "
-        f"{baseline_prefill_plus_decode / pd_dual_stream:.3f}x"
-    )
+        # Baseline step layout: [prefill chunk0..k-1, decode1, decode2, ...]
+        n_prefill_steps = _cdiv(P, args.chunk_size)
+        baseline_prefill = sum(
+            baseline_result[f"step{i}_mean_ms"] for i in range(n_prefill_steps)
+        )
+        baseline_decode1 = baseline_result[f"step{n_prefill_steps}_mean_ms"]
+        baseline_prefill_plus_decode = baseline_prefill + baseline_decode1
+
+        # PD step layout: [pioneer prefill, dual-stream1, dual-stream2, ...]
+        pd_prefill_only = pd_result["step0_mean_ms"]
+        pd_dual_stream = pd_result["step1_mean_ms"]
+
+        print(f"baseline prefill(200, chunked)        : {baseline_prefill:.3f} ms")
+        print(f"baseline decode step (128 beams)      : {baseline_decode1:.3f} ms")
+        print(f"baseline prefill+decode (sequential)  : {baseline_prefill_plus_decode:.3f} ms")
+        print(f"pd       prefill-only (200)           : {pd_prefill_only:.3f} ms")
+        print(f"pd       dual-stream step (P+D overlap): {pd_dual_stream:.3f} ms")
+        print(
+            f"speedup vs sequential                 : "
+            f"{baseline_prefill_plus_decode / pd_dual_stream:.3f}x"
+        )
 
 
 if __name__ == "__main__":
