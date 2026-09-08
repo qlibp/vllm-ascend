@@ -173,6 +173,16 @@ def build_worker(
     profiler_config: ProfilerConfig | None,
 ) -> NPUWorker:
     """Build a fully initialized worker following the vllm_ascend lifecycle."""
+    # Single-process benchmark: ``NPUWorker`` initializes torch.distributed with
+    # ``init_method="env://"``, which still requires MASTER_ADDR / MASTER_PORT /
+    # RANK / WORLD_SIZE even when world_size == 1.  Provide sane defaults without
+    # overriding values the caller may have already exported.
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+
     # Must be set before config creation: PDSeparationConfig is read from env
     # inside PDDualStreamModelRunner.__init__ and SchedulerPDSeparation.
     os.environ["VLLM_ASCEND_ENABLE_PD_SEPARATION"] = "1" if enable_pd else "0"
