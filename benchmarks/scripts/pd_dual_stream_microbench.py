@@ -7,13 +7,16 @@ This benchmark bypasses the scheduler entirely.  It constructs fake
 (prefill/decode forward + sampling + bookkeeping) without any scheduler or
 engine-loop overhead.
 
-Two scenarios are compared:
+Three scenarios are compared:
 
-* baseline  -- native vLLM chunked-prefill.  One 200-token prompt is split into
-  128 + 72 token chunks and run *sequentially*, then 128 beams decode for 2
-  steps.
-* pd        -- P/D dual-stream.  A pioneer prefill runs alone, then the next
-  prefill and the pioneer's 128-beam decode run *concurrently* on two streams.
+* baseline      -- native vLLM chunked-prefill.  One 200-token prompt is split
+  into 128 + 72 token chunks and run *sequentially*, then 128 beams decode for
+  2 steps.
+* baseline-nc   -- native vLLM single-shot prefill.  The same 200-token prompt
+  is prefilled in one step (no chunking), then 128 beams decode for 2 steps.
+* pd            -- P/D dual-stream.  A pioneer prefill runs alone, then the
+  next prefill and the pioneer's 128-beam decode run *concurrently* on two
+  streams.
 
 KV-cache data is intentionally NOT meaningful here.  The block ids are just
 monotonic integers; only the compute amount (num prefill tokens, num decode
@@ -22,9 +25,10 @@ tokens, num requests) matches the target scenario.
 Usage:
     # Recommended: run each scenario in its own process (clean device state).
     python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode baseline
+    python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode baseline-nc
     python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode pd
 
-    # Or run both back-to-back in one process (needs ~2x device memory).
+    # Or run all back-to-back in one process (needs ~3x device memory).
     python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode both \
         --profile --profile-dir /tmp/pd_traces
 """
@@ -180,6 +184,7 @@ def build_worker(
     max_num_batched_tokens: int,
     max_num_seqs: int,
     enable_pd: bool,
+    enable_chunked_prefill: bool,
     block_size: int,
     max_model_len: int,
     gpu_memory_utilization: float,
@@ -210,7 +215,7 @@ def build_worker(
         gpu_memory_utilization=gpu_memory_utilization,
         enforce_eager=enforce_eager,
         enable_prefix_caching=False,
-        enable_chunked_prefill=not enable_pd,
+        enable_chunked_prefill=enable_chunked_prefill,
     )
     if profiler_config is not None:
         engine_args.profiler_config = profiler_config
@@ -277,6 +282,59 @@ def reset_runner(runner, req_ids: set[str]) -> None:
 # --------------------------------------------------------------------------- #
 # Scenario step builders
 # --------------------------------------------------------------------------- #
+def _append_decode_steps(
+    runner,
+    steps: list[SchedulerOutput],
+    blk: BlockAlloc,
+    P: int,
+    B: int,
+    D: int,
+    sampling_params: SamplingParams,
+    prefix_blocks: tuple[int, ...],
+    finished_req_id: str,
+) -> set[str]:
+    """Append the decode steps shared by both baseline variants.
+
+    The first decode step fans out the finished prefill request into ``B`` new
+    beams; subsequent steps continue decoding those beams.  Returns the set of
+    beam request ids that need to be reset between iterations.
+    """
+    # First decode step -> B new beams, the prefill request is finished.
+    new_reqs = []
+    for i in range(B):
+        blocks = list(prefix_blocks) + blk.alloc(1)
+        new_reqs.append(make_new_decode(f"d{i}", P, P, blocks, sampling_params))
+    num_sched = {f"d{i}": 1 for i in range(B)}
+    steps.append(
+        make_scheduler_output(
+            runner,
+            new_reqs,
+            CachedRequestData.make_empty(),
+            num_sched,
+            finished={finished_req_id},
+        )
+    )
+
+    # Remaining decode steps (D - 1 = 1 by default).
+    beam_ids = [f"d{i}" for i in range(B)]
+    for step in range(1, D):
+        steps.append(
+            make_scheduler_output(
+                runner,
+                [],
+                make_cached(
+                    beam_ids,
+                    [P + step] * B,
+                    [(blk.alloc(1),) for _ in range(B)],
+                    [step] * B,
+                ),
+                num_sched,
+            )
+        )
+
+    return set(beam_ids)
+
+
 def build_baseline_steps(
     runner,
     P: int,
@@ -325,43 +383,40 @@ def build_baseline_steps(
         r0_blocks += new_blocks
         computed += chunk_len
 
-    # The decode beams share the pioneer prompt blocks (prefix cache semantics).
-    prefix_blocks = tuple(r0_blocks)
+    beam_ids = _append_decode_steps(
+        runner, steps, blk, P, B, D, sampling_params, tuple(r0_blocks), "r0"
+    )
+    return steps, beam_ids
 
-    # A3: first decode step -> B new beams, r0 is finished (fanned out).
-    new_reqs = []
-    for i in range(B):
-        blocks = list(prefix_blocks) + blk.alloc(1)
-        new_reqs.append(make_new_decode(f"d{i}", P, P, blocks, sampling_params))
-    num_sched = {f"d{i}": 1 for i in range(B)}
+
+def build_baseline_no_chunk_steps(
+    runner,
+    P: int,
+    B: int,
+    D: int,
+    sampling_params: SamplingParams,
+) -> tuple[list[SchedulerOutput], set[str]]:
+    """Native single-shot prefill (no chunking), then decode, all sequential."""
+    block_size = get_runner_block_size(runner)
+    blk = BlockAlloc()
+    nblocks = lambda t: _cdiv(t, block_size)
+    steps: list[SchedulerOutput] = []
+
+    # Single full prefill, scheduled as one step.
+    r0_blocks = blk.alloc(nblocks(P))
     steps.append(
         make_scheduler_output(
             runner,
-            new_reqs,
+            [make_new_prefill("r0", P, P, 0, r0_blocks, sampling_params)],
             CachedRequestData.make_empty(),
-            num_sched,
-            finished={"r0"},
+            {"r0": P},
         )
     )
 
-    # A4: remaining decode steps (D - 1 = 1 by default).
-    beam_ids = [f"d{i}" for i in range(B)]
-    for step in range(1, D):
-        steps.append(
-            make_scheduler_output(
-                runner,
-                [],
-                make_cached(
-                    beam_ids,
-                    [P + step] * B,
-                    [(blk.alloc(1),) for _ in range(B)],
-                    [step] * B,
-                ),
-                num_sched,
-            )
-        )
-
-    return steps, set(beam_ids)
+    beam_ids = _append_decode_steps(
+        runner, steps, blk, P, B, D, sampling_params, tuple(r0_blocks), "r0"
+    )
+    return steps, beam_ids
 
 
 def build_pd_steps(
@@ -494,12 +549,13 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="HuggingFace model id or path")
     parser.add_argument(
         "--mode",
-        choices=["baseline", "pd", "both"],
+        choices=["baseline", "baseline-nc", "pd", "both"],
         default="both",
         help=(
-            "Which scenario to run. 'baseline' and 'pd' run a single scenario in "
-            "this process (recommended for clean memory/device state); 'both' runs "
-            "the two scenarios back-to-back in one process for a direct comparison."
+            "Which scenario to run. 'baseline', 'baseline-nc' and 'pd' run a "
+            "single scenario in this process (recommended for clean memory/device "
+            "state); 'both' runs all three scenarios back-to-back in one process "
+            "for a direct comparison."
         ),
     )
     parser.add_argument("--prefill-len", type=int, default=200)
@@ -522,7 +578,8 @@ def main() -> None:
     B = args.beam_width
     D = args.output_tokens
     assert D >= 1, "output-tokens must be >= 1"
-    assert P > args.chunk_size, "prefill-len must be > chunk-size for chunked baseline"
+    if args.mode in ("baseline", "both"):
+        assert P > args.chunk_size, "prefill-len must be > chunk-size for chunked baseline"
 
     sampling_params = SamplingParams(n=1, temperature=0.0)
 
@@ -551,6 +608,7 @@ def main() -> None:
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=args.max_num_seqs,
             enable_pd=False,
+            enable_chunked_prefill=True,
             block_size=args.block_size,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
@@ -576,6 +634,39 @@ def main() -> None:
         )
         print(baseline_result)
 
+    if mode in ("baseline-nc", "both"):
+        print("== Building baseline-nc worker (single-shot prefill) ==")
+        baseline_nc_worker = build_worker(
+            args.model,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            enable_pd=False,
+            enable_chunked_prefill=False,
+            block_size=args.block_size,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=args.enforce_eager,
+            profiler_config=profiler_config,
+        )
+        baseline_nc_runner = baseline_nc_worker.model_runner
+
+        baseline_nc_steps, baseline_nc_reset = build_baseline_no_chunk_steps(
+            baseline_nc_runner, P, B, D, sampling_params
+        )
+
+        print("\n== Baseline no-chunk (single-shot prefill) ==")
+        baseline_nc_result = measure_scenario(
+            baseline_nc_runner,
+            baseline_nc_steps,
+            baseline_nc_reset,
+            args.warmup,
+            args.iters,
+            args.profile,
+            baseline_nc_worker,
+            "baseline-nc",
+        )
+        print(baseline_nc_result)
+
     if mode in ("pd", "both"):
         print("== Building PD worker (P/D dual-stream) ==")
         pd_worker = build_worker(
@@ -583,6 +674,7 @@ def main() -> None:
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=args.max_num_seqs,
             enable_pd=True,
+            enable_chunked_prefill=False,
             block_size=args.block_size,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
@@ -619,18 +711,33 @@ def main() -> None:
         baseline_decode1 = baseline_result[f"step{n_prefill_steps}_mean_ms"]
         baseline_prefill_plus_decode = baseline_prefill + baseline_decode1
 
+        # Baseline-nc step layout: [prefill, decode1, decode2, ...]
+        baseline_nc_prefill = baseline_nc_result["step0_mean_ms"]
+        baseline_nc_decode1 = baseline_nc_result["step1_mean_ms"]
+        baseline_nc_prefill_plus_decode = baseline_nc_prefill + baseline_nc_decode1
+
         # PD step layout: [pioneer prefill, dual-stream1, dual-stream2, ...]
         pd_prefill_only = pd_result["step0_mean_ms"]
         pd_dual_stream = pd_result["step1_mean_ms"]
 
-        print(f"baseline prefill(200, chunked)        : {baseline_prefill:.3f} ms")
-        print(f"baseline decode step (128 beams)      : {baseline_decode1:.3f} ms")
-        print(f"baseline prefill+decode (sequential)  : {baseline_prefill_plus_decode:.3f} ms")
-        print(f"pd       prefill-only (200)           : {pd_prefill_only:.3f} ms")
-        print(f"pd       dual-stream step (P+D overlap): {pd_dual_stream:.3f} ms")
+        print(f"baseline    prefill(200, chunked)     : {baseline_prefill:.3f} ms")
+        print(f"baseline    decode step (128 beams)   : {baseline_decode1:.3f} ms")
+        print(f"baseline    prefill+decode (sequential): {baseline_prefill_plus_decode:.3f} ms")
+        print(f"baseline-nc prefill(200, single-shot) : {baseline_nc_prefill:.3f} ms")
+        print(f"baseline-nc decode step (128 beams)   : {baseline_nc_decode1:.3f} ms")
         print(
-            f"speedup vs sequential                 : "
+            f"baseline-nc prefill+decode (sequential): "
+            f"{baseline_nc_prefill_plus_decode:.3f} ms"
+        )
+        print(f"pd          prefill-only (200)        : {pd_prefill_only:.3f} ms")
+        print(f"pd          dual-stream step (P+D overlap): {pd_dual_stream:.3f} ms")
+        print(
+            f"speedup vs sequential (chunked)       : "
             f"{baseline_prefill_plus_decode / pd_dual_stream:.3f}x"
+        )
+        print(
+            f"speedup vs sequential (no-chunk)      : "
+            f"{baseline_nc_prefill_plus_decode / pd_dual_stream:.3f}x"
         )
 
 
