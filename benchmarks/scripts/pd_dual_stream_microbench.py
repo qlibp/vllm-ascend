@@ -656,12 +656,18 @@ def measure_scenario(
             run_step(runner, copy.deepcopy(so))
         reset_runner(runner, req_ids_to_reset)
 
-    if profile:
-        worker.profile(is_start=True, profile_prefix=profile_prefix)
-
     step_times: list[list[float]] = [[] for _ in steps]
     totals: list[float] = []
     for _ in range(iters):
+        # Profile only the benchmark steps.  ``reset_runner`` below must stay
+        # outside the profiled window; otherwise every iteration's cleanup
+        # ``execute_model`` would also be recorded in the trace.  The runner is
+        # already clean at the top of each iteration: the first iteration starts
+        # from the post-warmup clean state, and every later iteration was reset
+        # at the bottom of the previous one.
+        if profile:
+            worker.profile(is_start=True, profile_prefix=profile_prefix)
+
         it_total = 0.0
         for idx, so in enumerate(steps):
             # Deep-copy before starting the timer so clone cost is not measured.
@@ -669,10 +675,11 @@ def measure_scenario(
             step_times[idx].append(dt)
             it_total += dt
         totals.append(it_total)
-        reset_runner(runner, req_ids_to_reset)
 
-    if profile:
-        worker.profile(is_start=False)
+        if profile:
+            worker.profile(is_start=False)
+
+        reset_runner(runner, req_ids_to_reset)
 
     result: dict[str, float] = {
         "total_mean_ms": statistics.mean(totals),
