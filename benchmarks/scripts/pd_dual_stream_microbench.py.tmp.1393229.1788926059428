@@ -117,59 +117,63 @@ def _validate_steps_against_block_table(runner, steps: list[SchedulerOutput]) ->
     the opaque ``ValueError: could not broadcast input array from shape (X,)
     into shape (Y,)``.
     """
-    block_tables = runner.input_batch.block_table.block_tables
+    bt = runner.input_batch.block_table.block_tables[0]
+    row_width = int(bt.block_table.np.shape[1])
+    bpp = int(getattr(bt, "blocks_per_phys_block", 1))
+    physical_capacity = row_width // bpp
+    use_hybrid = bool(getattr(bt, "use_hybrid_blocks", False))
 
-    for gid, bt in enumerate(block_tables):
-        row_width = int(bt.block_table.np.shape[1])
-        bpp = int(getattr(bt, "blocks_per_phys_block", 1))
-        physical_capacity = row_width // bpp
-        use_hybrid = bool(getattr(bt, "use_hybrid_blocks", False))
-
-        print(
-            f"[validate] group={gid} block_table.np.shape={tuple(bt.block_table.np.shape)} "
-            f"physical_block_size={getattr(bt, 'physical_block_size', None)} "
-            f"max_num_blocks_per_req={getattr(bt, 'max_num_blocks_per_req', None)} "
-            f"kernel_block_size={getattr(bt, 'block_size', None)} "
-            f"blocks_per_phys_block={bpp} use_hybrid_blocks={use_hybrid} "
-            f"=> physical_capacity={physical_capacity} row_width={row_width}"
+    print(
+        "[validate] block_table.np.shape=%s physical_block_size=%s "
+        "max_num_blocks_per_req=%s kernel_block_size=%s blocks_per_phys_block=%s "
+        "use_hybrid_blocks=%s => physical_capacity=%s"
+        % (
+            tuple(bt.block_table.np.shape),
+            getattr(bt, "physical_block_size", None),
+            getattr(bt, "max_num_blocks_per_req", None),
+            getattr(bt, "block_size", None),
+            bpp,
+            use_hybrid,
+            physical_capacity,
         )
+    )
 
-        # Per-request accumulated physical-block count, mirroring
-        # ``num_blocks_per_row`` + ``append_row``/``add_row`` across steps.
-        acc: dict[str, int] = {}
+    # Per-request accumulated physical-block count, mirroring
+    # ``num_blocks_per_row`` + ``append_row``/``add_row`` across steps.
+    acc: dict[str, int] = {}
 
-        for step_idx, so in enumerate(steps):
-            for req in so.scheduled_new_reqs:
-                blocks = req.block_ids[gid]
-                acc[req.req_id] = len(blocks)
-                logical_len = len(blocks) * bpp
-                if logical_len > row_width:
-                    raise ValueError(
-                        f"step {step_idx}: new request {req.req_id!r} has "
-                        f"{len(blocks)} physical blocks -> {logical_len} logical "
-                        f"blocks, but block-table group {gid} row width is "
-                        f"{row_width}. (physical_block_size={bt.physical_block_size}, "
-                        f"blocks_per_phys_block={bpp})"
-                    )
+    for step_idx, so in enumerate(steps):
+        for req in so.scheduled_new_reqs:
+            blocks = req.block_ids[0]
+            acc[req.req_id] = len(blocks)
+            logical_len = len(blocks) * bpp
+            if logical_len > row_width:
+                raise ValueError(
+                    f"step {step_idx}: new request {req.req_id!r} has "
+                    f"{len(blocks)} physical blocks -> {logical_len} logical "
+                    f"blocks, but the block-table row width is {row_width}. "
+                    f"(physical_block_size={bt.physical_block_size}, "
+                    f"blocks_per_phys_block={bpp})"
+                )
 
-            cached = so.scheduled_cached_reqs
-            for i, req_id in enumerate(cached.req_ids):
-                new_ids = cached.new_block_ids[i]
-                if new_ids is None:
-                    continue
-                new_blocks = new_ids[gid]
-                prev = acc.get(req_id, 0)
-                acc[req_id] = prev + len(new_blocks)
-                logical_len = acc[req_id] * bpp
-                if logical_len > row_width:
-                    raise ValueError(
-                        f"step {step_idx}: cached request {req_id!r} grows to "
-                        f"{acc[req_id]} physical blocks -> {logical_len} logical "
-                        f"blocks, but block-table group {gid} row width is "
-                        f"{row_width}. (previous={prev}, appended={len(new_blocks)}, "
-                        f"physical_block_size={bt.physical_block_size}, "
-                        f"blocks_per_phys_block={bpp})"
-                    )
+        cached = so.scheduled_cached_reqs
+        for i, req_id in enumerate(cached.req_ids):
+            new_ids = cached.new_block_ids[i]
+            if new_ids is None:
+                continue
+            new_blocks = new_ids[0]
+            prev = acc.get(req_id, 0)
+            acc[req_id] = prev + len(new_blocks)
+            logical_len = acc[req_id] * bpp
+            if logical_len > row_width:
+                raise ValueError(
+                    f"step {step_idx}: cached request {req_id!r} grows to "
+                    f"{acc[req_id]} physical blocks -> {logical_len} logical "
+                    f"blocks, but the block-table row width is {row_width}. "
+                    f"(previous={prev}, appended={len(new_blocks)}, "
+                    f"physical_block_size={bt.physical_block_size}, "
+                    f"blocks_per_phys_block={bpp})"
+                )
 
 
 @dataclass
