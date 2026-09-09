@@ -703,7 +703,7 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=128, help="baseline chunk size")
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument("--max-num-seqs", type=int, default=256)
-    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=1024)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--enforce-eager", action="store_true")
@@ -730,13 +730,19 @@ def main() -> None:
             torch_profiler_dir=os.path.abspath(args.profile_dir),
         )
 
-    # ``max_num_batched_tokens`` is only the runner's buffer capacity.  The
-    # baseline chunk size is controlled independently by --chunk-size in the
-    # fake SchedulerOutput below.
+    # ``max_num_batched_tokens`` is the runner's buffer capacity.  The baseline
+    # chunk size is controlled independently by --chunk-size in the fake
+    # SchedulerOutput below.  For non-chunked scenarios (baseline-nc / pd) the
+    # scheduler config requires ``max_num_batched_tokens >= max_model_len``, so
+    # bump the default accordingly; chunked baseline can keep the smaller value.
     default_mnt = max(P, B, args.max_num_seqs)
-    max_num_batched_tokens = (
-        default_mnt if args.max_num_batched_tokens is None else args.max_num_batched_tokens
-    )
+    non_chunked = args.mode in ("baseline-nc", "pd", "both")
+    if args.max_num_batched_tokens is None:
+        max_num_batched_tokens = default_mnt
+        if non_chunked:
+            max_num_batched_tokens = max(max_num_batched_tokens, args.max_model_len)
+    else:
+        max_num_batched_tokens = args.max_num_batched_tokens
 
     mode = args.mode
 
