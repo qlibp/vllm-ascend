@@ -75,6 +75,22 @@ def get_runner_block_size(runner) -> int:
     return runner.input_batch.block_table.block_tables[0].physical_block_size
 
 
+def _check_max_model_len(runner, P: int, D: int) -> None:
+    """Fail fast instead of hitting an obscure block-table broadcast error.
+
+    A request may use at most ``max_num_blocks_per_req`` blocks, which is derived
+    from ``max_model_len``.  The decode beams hold ``P`` prompt tokens plus up to
+    ``D`` output tokens, so ``P + D`` must fit within the model's context length.
+    """
+    max_len = runner.max_model_len
+    if P + D > max_len:
+        raise ValueError(
+            f"prefill_len + output_tokens ({P + D}) exceeds model max_model_len "
+            f"({max_len}); reduce --prefill-len / --output-tokens or increase "
+            f"--max-model-len"
+        )
+
+
 @dataclass
 class BlockAlloc:
     """Monotonic block-id allocator.  Correctness of KV data is irrelevant;
@@ -299,10 +315,16 @@ def _append_decode_steps(
     beams; subsequent steps continue decoding those beams.  Returns the set of
     beam request ids that need to be reset between iterations.
     """
+    block_size = get_runner_block_size(runner)
+    nblocks = lambda t: _cdiv(t, block_size)
+
     # First decode step -> B new beams, the prefill request is finished.
+    # The beams share ``prefix_blocks`` (nblocks(P) prompt blocks) and only add
+    # the extra blocks needed for the first output token.
+    first_output_blocks = nblocks(P + 1) - nblocks(P)
     new_reqs = []
     for i in range(B):
-        blocks = list(prefix_blocks) + blk.alloc(1)
+        blocks = list(prefix_blocks) + blk.alloc(first_output_blocks)
         new_reqs.append(make_new_decode(f"d{i}", P, P, blocks, sampling_params))
     num_sched = {f"d{i}": 1 for i in range(B)}
     steps.append(
@@ -315,9 +337,11 @@ def _append_decode_steps(
         )
     )
 
-    # Remaining decode steps (D - 1 = 1 by default).
+    # Remaining decode steps (D - 1 = 1 by default).  Allocate only the blocks
+    # newly required when advancing from ``P + step`` to ``P + step + 1`` tokens.
     beam_ids = [f"d{i}" for i in range(B)]
     for step in range(1, D):
+        step_blocks = nblocks(P + step + 1) - nblocks(P + step)
         steps.append(
             make_scheduler_output(
                 runner,
@@ -325,7 +349,7 @@ def _append_decode_steps(
                 make_cached(
                     beam_ids,
                     [P + step] * B,
-                    [(blk.alloc(1),) for _ in range(B)],
+                    [(blk.alloc(step_blocks),) for _ in range(B)],
                     [step] * B,
                 ),
                 num_sched,
@@ -344,18 +368,22 @@ def build_baseline_steps(
     sampling_params: SamplingParams,
 ) -> tuple[list[SchedulerOutput], set[str]]:
     """Native chunked-prefill, prefill chunks then decode, all sequential."""
+    _check_max_model_len(runner, P, D)
     block_size = get_runner_block_size(runner)
     blk = BlockAlloc()
     nblocks = lambda t: _cdiv(t, block_size)
     steps: list[SchedulerOutput] = []
 
-    # Split the prompt into ceil(P / chunk) chunks.
+    # Split the prompt into ceil(P / chunk) chunks.  Allocate only the blocks
+    # newly needed for each chunk (delta of total-token block counts) so the
+    # final request uses exactly nblocks(P) blocks instead of over-counting at
+    # chunk boundaries.
     r0_blocks: list[int] = []
     computed = 0
     first = True
     while computed < P:
         chunk_len = min(chunk, P - computed)
-        new_blocks = blk.alloc(nblocks(chunk_len))
+        new_blocks = blk.alloc(nblocks(computed + chunk_len) - nblocks(computed))
         if first:
             steps.append(
                 make_scheduler_output(
@@ -397,6 +425,7 @@ def build_baseline_no_chunk_steps(
     sampling_params: SamplingParams,
 ) -> tuple[list[SchedulerOutput], set[str]]:
     """Native single-shot prefill (no chunking), then decode, all sequential."""
+    _check_max_model_len(runner, P, D)
     block_size = get_runner_block_size(runner)
     blk = BlockAlloc()
     nblocks = lambda t: _cdiv(t, block_size)
@@ -432,6 +461,7 @@ def build_pd_steps(
     B1: A's 128-beam decode + prefill B in dual-stream.
     B2 (optional): A's beams decode + prefill C in dual-stream.
     """
+    _check_max_model_len(runner, P, D)
     block_size = get_runner_block_size(runner)
     blk = BlockAlloc()
     nblocks = lambda t: _cdiv(t, block_size)
@@ -452,9 +482,12 @@ def build_pd_steps(
     prefix_blocks = tuple(A_blocks)
 
     # B1: dual-stream step -- 128 new decode beams + a new prefill B.
+    # Beams share ``prefix_blocks`` (nblocks(P)) and add only the blocks needed
+    # for their first output token.
+    first_output_blocks = nblocks(P + 1) - nblocks(P)
     new_reqs = []
     for i in range(B):
-        blocks = list(prefix_blocks) + blk.alloc(1)
+        blocks = list(prefix_blocks) + blk.alloc(first_output_blocks)
         new_reqs.append(make_new_decode(f"d{i}", P, P, blocks, sampling_params))
     B_blocks = blk.alloc(nblocks(P))
     new_reqs.append(make_new_prefill("B", P, P, 0, B_blocks, sampling_params))
@@ -479,6 +512,7 @@ def build_pd_steps(
         new_reqs = [make_new_prefill(next_prefill, P, P, 0, p_blocks, sampling_params)]
         num_sched = {f"d{i}": 1 for i in range(B)}
         num_sched[next_prefill] = P
+        step_blocks = nblocks(P + step + 1) - nblocks(P + step)
         steps.append(
             make_scheduler_output(
                 runner,
@@ -486,7 +520,7 @@ def build_pd_steps(
                 make_cached(
                     beam_ids,
                     [P + step] * B,
-                    [(blk.alloc(1),) for _ in range(B)],
+                    [(blk.alloc(step_blocks),) for _ in range(B)],
                     [step] * B,
                 ),
                 num_sched,
