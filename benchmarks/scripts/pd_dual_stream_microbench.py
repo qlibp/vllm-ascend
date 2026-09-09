@@ -36,6 +36,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import statistics
 import time
@@ -400,8 +401,20 @@ def _append_decode_steps(
     nblocks = lambda t: _cdiv(t, block_size)
 
     # First decode step -> B new beams, the prefill request is finished.
-    # The beams share ``prefix_blocks`` (nblocks(P) prompt blocks) and only add
-    # the extra blocks needed for the first output token.
+    #
+    # Block-id sharing: each beam reuses the shared prompt ``prefix_blocks``
+    # (prefix-cache semantics, read-only during decode) and appends its own
+    # newly allocated output blocks.  ``blk.alloc()`` is called inside the loop,
+    # so when ``first_output_blocks > 0`` every beam gets a *distinct* output
+    # block and writes to different physical slots.
+    #
+    # However, when ``first_output_blocks == 0`` (e.g. the default P=200 with
+    # block_size=16: nblocks(201) == nblocks(200) == 13), the first generated
+    # token still falls inside the last shared prompt block.  In that case all
+    # B beams write their first output token into the *same* physical block/slot,
+    # overwriting each other's KV.  This is a KV-data collision, not a bug for
+    # this benchmark: KV correctness is intentionally ignored here (see module
+    # docstring), and slot collisions do not change the measured compute amount.
     first_output_blocks = nblocks(P + 1) - nblocks(P)
     new_reqs = []
     for i in range(B):
@@ -420,6 +433,11 @@ def _append_decode_steps(
 
     # Remaining decode steps (D - 1 = 1 by default).  Allocate only the blocks
     # newly required when advancing from ``P + step`` to ``P + step + 1`` tokens.
+    #
+    # Same sharing note as above: when ``step_blocks == 0`` (the default P=200,
+    # D=2 keeps every output token inside the last prompt block), each beam's
+    # generated token again lands in the shared prompt block and collides.  This
+    # is acceptable here because KV data is not meaningful for this benchmark.
     beam_ids = [f"d{i}" for i in range(B)]
     for step in range(1, D):
         step_blocks = nblocks(P + step + 1) - nblocks(P + step)
@@ -630,7 +648,12 @@ def measure_scenario(
     # Warmup.
     for _ in range(warmup):
         for so in steps:
-            run_step(runner, so)
+            # ``_update_states`` extends ``req_state.block_ids`` in place, and
+            # those lists are the same objects stored in ``so``.  Reusing ``so``
+            # across iterations would grow the lists every iteration and
+            # eventually overflow the block-table row width.  Deep-copy the step
+            # so each iteration starts from the original (fixed) block ids.
+            run_step(runner, copy.deepcopy(so))
         reset_runner(runner, req_ids_to_reset)
 
     if profile:
@@ -641,7 +664,8 @@ def measure_scenario(
     for _ in range(iters):
         it_total = 0.0
         for idx, so in enumerate(steps):
-            dt = timed_step(runner, so)
+            # Deep-copy before starting the timer so clone cost is not measured.
+            dt = timed_step(runner, copy.deepcopy(so))
             step_times[idx].append(dt)
             it_total += dt
         totals.append(it_total)
