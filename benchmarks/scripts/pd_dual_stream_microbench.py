@@ -40,7 +40,7 @@ from math import ceil
 
 import torch
 
-from vllm.config import ProfilerConfig
+from vllm.config import ProfilerConfig, set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
@@ -203,23 +203,28 @@ def build_worker(
 
     vllm_config = engine_args.create_engine_config()
 
-    worker = NPUWorker(
-        vllm_config=vllm_config,
-        local_rank=0,
-        rank=0,
-        distributed_init_method="env://",
-        is_driver_worker=True,
-    )
-    worker.init_device()
-    worker.load_model()
+    # Normal vLLM goes through WorkerWrapperBase, which wraps init_device /
+    # load_model / initialize_from_config in ``set_current_vllm_config(...)``.
+    # We instantiate NPUWorker directly, so replicate that here; otherwise HCCL
+    # pg-option setup calls get_current_vllm_config() and raises AssertionError.
+    with set_current_vllm_config(vllm_config):
+        worker = NPUWorker(
+            vllm_config=vllm_config,
+            local_rank=0,
+            rank=0,
+            distributed_init_method="env://",
+            is_driver_worker=True,
+        )
+        worker.init_device()
+        worker.load_model()
 
-    available_memory = worker.determine_available_memory()
-    kv_cache_spec = worker.model_runner.get_kv_cache_spec()
-    kv_cache_config = get_kv_cache_configs(
-        vllm_config, [kv_cache_spec], [available_memory]
-    )[0]
-    worker.initialize_from_config(kv_cache_config)
-    worker.compile_or_warm_up_model()
+        available_memory = worker.determine_available_memory()
+        kv_cache_spec = worker.model_runner.get_kv_cache_spec()
+        kv_cache_config = get_kv_cache_configs(
+            vllm_config, [kv_cache_spec], [available_memory]
+        )[0]
+        worker.initialize_from_config(kv_cache_config)
+        worker.compile_or_warm_up_model()
 
     return worker
 
