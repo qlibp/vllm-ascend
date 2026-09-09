@@ -57,6 +57,20 @@ def _cdiv(a: int, b: int) -> int:
     return ceil(a / b)
 
 
+def get_runner_block_size(runner) -> int:
+    """Return the KV-cache manager block size actually used by ``runner``.
+
+    ``cache_config.block_size`` (what the CLI ``--block-size`` controls) is only
+    the requested page size.  On Ascend the attention backend may select a
+    different common block size (``select_common_block_size``), and
+    ``kv_cache_spec.block_size`` ends up being the value the block table is
+    actually sized with.  We must allocate fake block ids in units of that
+    value, otherwise ``BlockTable.append_row`` overruns a row and raises
+    ``ValueError: could not broadcast ... into shape (0,)``.
+    """
+    return runner.input_batch.block_table.block_tables[0].physical_block_size
+
+
 @dataclass
 class BlockAlloc:
     """Monotonic block-id allocator.  Correctness of KV data is irrelevant;
@@ -270,9 +284,9 @@ def build_baseline_steps(
     D: int,
     chunk: int,
     sampling_params: SamplingParams,
-    block_size: int,
 ) -> tuple[list[SchedulerOutput], set[str]]:
     """Native chunked-prefill, prefill chunks then decode, all sequential."""
+    block_size = get_runner_block_size(runner)
     blk = BlockAlloc()
     nblocks = lambda t: _cdiv(t, block_size)
     steps: list[SchedulerOutput] = []
@@ -356,7 +370,6 @@ def build_pd_steps(
     B: int,
     D: int,
     sampling_params: SamplingParams,
-    block_size: int,
 ) -> tuple[list[SchedulerOutput], set[str]]:
     """P/D dual-stream timeline.
 
@@ -364,6 +377,7 @@ def build_pd_steps(
     B1: A's 128-beam decode + prefill B in dual-stream.
     B2 (optional): A's beams decode + prefill C in dual-stream.
     """
+    block_size = get_runner_block_size(runner)
     blk = BlockAlloc()
     nblocks = lambda t: _cdiv(t, block_size)
     steps: list[SchedulerOutput] = []
@@ -546,7 +560,7 @@ def main() -> None:
         baseline_runner = baseline_worker.model_runner
 
         baseline_steps, baseline_reset = build_baseline_steps(
-            baseline_runner, P, B, D, args.chunk_size, sampling_params, args.block_size
+            baseline_runner, P, B, D, args.chunk_size, sampling_params
         )
 
         print("\n== Baseline (chunked prefill) ==")
@@ -578,7 +592,7 @@ def main() -> None:
         pd_runner = pd_worker.model_runner
 
         pd_steps, pd_reset = build_pd_steps(
-            pd_runner, P, B, D, sampling_params, args.block_size
+            pd_runner, P, B, D, sampling_params
         )
 
         print("\n== PD dual-stream ==")
