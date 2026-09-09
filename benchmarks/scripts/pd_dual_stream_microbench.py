@@ -75,19 +75,35 @@ def get_runner_block_size(runner) -> int:
     return runner.input_batch.block_table.block_tables[0].physical_block_size
 
 
-def _check_max_model_len(runner, P: int, D: int) -> None:
+def get_runner_max_blocks_per_req(runner) -> int:
+    """Return the maximum number of physical blocks one request may occupy.
+
+    This is the block-table row width in physical-block units and is the hard
+    upper bound on ``len(block_ids)`` for any single request.  It is derived
+    from ``max_model_len`` and ``kv_cache_spec.block_size``, but reading it
+    directly avoids any mismatch with ``runner.max_model_len``.
+    """
+    return runner.input_batch.block_table.block_tables[0].max_num_blocks_per_req
+
+
+def _check_request_fits(runner, P: int, D: int) -> None:
     """Fail fast instead of hitting an obscure block-table broadcast error.
 
-    A request may use at most ``max_num_blocks_per_req`` blocks, which is derived
-    from ``max_model_len``.  The decode beams hold ``P`` prompt tokens plus up to
-    ``D`` output tokens, so ``P + D`` must fit within the model's context length.
+    The block-table row has exactly ``max_num_blocks_per_req`` physical-block
+    slots.  A request spanning ``P`` prompt tokens plus ``D`` output tokens needs
+    ``cdiv(P + D, block_size)`` blocks, so that value must not exceed the row
+    width.
     """
-    max_len = runner.max_model_len
-    if P + D > max_len:
+    block_size = get_runner_block_size(runner)
+    max_blocks = get_runner_max_blocks_per_req(runner)
+    needed = _cdiv(P + D, block_size)
+    if needed > max_blocks:
         raise ValueError(
-            f"prefill_len + output_tokens ({P + D}) exceeds model max_model_len "
-            f"({max_len}); reduce --prefill-len / --output-tokens or increase "
-            f"--max-model-len"
+            f"scenario does not fit in the model's KV-cache block table: "
+            f"prefill_len + output_tokens = {P + D} tokens needs {needed} blocks "
+            f"(block_size={block_size}), but max_num_blocks_per_req is "
+            f"{max_blocks}. Reduce --prefill-len / --output-tokens, or increase "
+            f"--max-model-len."
         )
 
 
@@ -368,7 +384,7 @@ def build_baseline_steps(
     sampling_params: SamplingParams,
 ) -> tuple[list[SchedulerOutput], set[str]]:
     """Native chunked-prefill, prefill chunks then decode, all sequential."""
-    _check_max_model_len(runner, P, D)
+    _check_request_fits(runner, P, D)
     block_size = get_runner_block_size(runner)
     blk = BlockAlloc()
     nblocks = lambda t: _cdiv(t, block_size)
@@ -425,7 +441,7 @@ def build_baseline_no_chunk_steps(
     sampling_params: SamplingParams,
 ) -> tuple[list[SchedulerOutput], set[str]]:
     """Native single-shot prefill (no chunking), then decode, all sequential."""
-    _check_max_model_len(runner, P, D)
+    _check_request_fits(runner, P, D)
     block_size = get_runner_block_size(runner)
     blk = BlockAlloc()
     nblocks = lambda t: _cdiv(t, block_size)
@@ -461,7 +477,7 @@ def build_pd_steps(
     B1: A's 128-beam decode + prefill B in dual-stream.
     B2 (optional): A's beams decode + prefill C in dual-stream.
     """
-    _check_max_model_len(runner, P, D)
+    _check_request_fits(runner, P, D)
     block_size = get_runner_block_size(runner)
     blk = BlockAlloc()
     nblocks = lambda t: _cdiv(t, block_size)
