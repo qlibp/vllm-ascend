@@ -390,6 +390,12 @@ def apply_core_limit(device: torch.device, cube_num: int, vector_num: int) -> No
     stream = torch.npu.default_stream(device)
     print(f"[core-limit] default stream cube_num={cube_num} vector_num={vector_num}")
     torch_npu.npu.set_stream_limit(stream, cube_num=cube_num, vector_num=vector_num)
+    stream_limit = torch_npu.npu.get_stream_limit(stream)
+    print(
+        f"[core-limit] default stream actual limit: "
+        f"cube_core_num={stream_limit.get('cube_core_num')} "
+        f"vector_core_num={stream_limit.get('vector_core_num')}"
+    )
 
 
 def reset_runner(runner, req_ids: set[str]) -> None:

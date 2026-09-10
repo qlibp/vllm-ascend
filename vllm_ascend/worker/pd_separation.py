@@ -233,6 +233,14 @@ class PDStreamContext:
             cube_num=self.cube_num,
             vector_num=self.vector_num,
         )
+        stream_limit = torch_npu.npu.get_stream_limit(self.stream)
+        logger.info(
+            "Stream limit for %s stream after set: cube_core_num=%s "
+            "vector_core_num=%s",
+            self.name,
+            stream_limit.get("cube_core_num"),
+            stream_limit.get("vector_core_num"),
+        )
 
 
 class PDDualStreamGraphManager:
