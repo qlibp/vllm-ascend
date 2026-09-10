@@ -9,7 +9,7 @@
 #   MODE=baseline MODEL=/path/to/model ./run_pd_dual_stream_microbench.sh
 #   MODE=pd       MODEL=/path/to/model ./run_pd_dual_stream_microbench.sh
 #
-#   # both back-to-back in one process (needs ~2x device memory)
+#   # both back-to-back in one process (needs ~4x device memory)
 #   MODE=both MODEL=/path/to/model ./run_pd_dual_stream_microbench.sh
 #
 #   # with profiler
@@ -48,8 +48,9 @@ fi
 
 # --- Benchmark parameters (env-var driven) --------------------------------- #
 MODEL="${MODEL:-}"
-# baseline | pd | both.  Default to a single scenario so each run has clean
-# device/memory state; run the two modes in separate processes and compare.
+# baseline | baseline-nc | baseline-nc-limit | pd | both.  Default to a single
+# scenario so each run has clean device/memory state; run the modes in separate
+# processes and compare.
 MODE="${MODE:-baseline}"
 PREFILL_LEN="${PREFILL_LEN:-200}"
 BEAM_WIDTH="${BEAM_WIDTH:-128}"
@@ -60,6 +61,8 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
 BLOCK_SIZE="${BLOCK_SIZE:-128}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1024}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
+LIMIT_CUBE_NUM="${LIMIT_CUBE_NUM:-12}"
+LIMIT_VECTOR_NUM="${LIMIT_VECTOR_NUM:-24}"
 WARMUP="${WARMUP:-5}"
 ITERS="${ITERS:-20}"
 PROFILE="${PROFILE:-0}"
@@ -89,6 +92,8 @@ CMD=(
   --block-size "$BLOCK_SIZE"
   --max-model-len "$MAX_MODEL_LEN"
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+  --limit-cube-num "$LIMIT_CUBE_NUM"
+  --limit-vector-num "$LIMIT_VECTOR_NUM"
   --warmup "$WARMUP"
   --iters "$ITERS"
 )

@@ -7,13 +7,17 @@ This benchmark bypasses the scheduler entirely.  It constructs fake
 (prefill/decode forward + sampling + bookkeeping) without any scheduler or
 engine-loop overhead.
 
-Three scenarios are compared:
+Four scenarios are compared:
 
 * baseline      -- native vLLM chunked-prefill.  One 200-token prompt is split
   into 128 + 72 token chunks and run *sequentially*, then 128 beams decode for
   2 steps.
 * baseline-nc   -- native vLLM single-shot prefill.  The same 200-token prompt
   is prefilled in one step (no chunking), then 128 beams decode for 2 steps.
+* baseline-nc-limit -- same steps as ``baseline-nc``, but the default stream's
+  AI-core count is limited via ``torch_npu.npu.set_stream_limit`` to match a
+  single P/D stream's partition, so the sequential prefill+decode time can be
+  compared against the dual-stream overlap.
 * pd            -- P/D dual-stream.  A pioneer prefill runs alone, then the
   next prefill and the pioneer's 128-beam decode run *concurrently* on two
   streams.
@@ -26,9 +30,10 @@ Usage:
     # Recommended: run each scenario in its own process (clean device state).
     python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode baseline
     python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode baseline-nc
+    python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode baseline-nc-limit
     python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode pd
 
-    # Or run all back-to-back in one process (needs ~3x device memory).
+    # Or run all back-to-back in one process (needs ~4x device memory).
     python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode both \
         --profile --profile-dir /tmp/pd_traces
 """
@@ -44,6 +49,7 @@ from dataclasses import dataclass
 from math import ceil
 
 import torch
+import torch_npu
 
 from vllm.config import ProfilerConfig, set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
@@ -367,6 +373,23 @@ def timed_step(runner, scheduler_output: SchedulerOutput) -> float:
     torch.npu.synchronize()
     t1 = time.perf_counter()
     return (t1 - t0) * 1e3  # ms
+
+
+def apply_core_limit(device: torch.device, cube_num: int, vector_num: int) -> None:
+    """Limit AI cores on the default NPU stream.
+
+    Used by the ``baseline-nc-limit`` scenario to run the baseline runner with
+    the same per-stream core partition as a single P/D stream (see
+    ``PDStreamContext.apply_stream_limit``).  The baseline runner executes both
+    prefill and decode on the default stream, so a single partition is applied
+    to every step.  A value of ``-1`` for either count leaves that resource on
+    the runtime default.
+    """
+    if cube_num < 0 and vector_num < 0:
+        return
+    stream = torch.npu.default_stream(device)
+    print(f"[core-limit] default stream cube_num={cube_num} vector_num={vector_num}")
+    torch_npu.npu.set_stream_limit(stream, cube_num=cube_num, vector_num=vector_num)
 
 
 def reset_runner(runner, req_ids: set[str]) -> None:
@@ -695,13 +718,13 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="HuggingFace model id or path")
     parser.add_argument(
         "--mode",
-        choices=["baseline", "baseline-nc", "pd", "both"],
+        choices=["baseline", "baseline-nc", "baseline-nc-limit", "pd", "both"],
         default="both",
         help=(
-            "Which scenario to run. 'baseline', 'baseline-nc' and 'pd' run a "
-            "single scenario in this process (recommended for clean memory/device "
-            "state); 'both' runs all three scenarios back-to-back in one process "
-            "for a direct comparison."
+            "Which scenario to run. 'baseline', 'baseline-nc', "
+            "'baseline-nc-limit' and 'pd' run a single scenario in this process "
+            "(recommended for clean memory/device state); 'both' runs all "
+            "scenarios back-to-back in one process for a direct comparison."
         ),
     )
     parser.add_argument("--prefill-len", type=int, default=200)
@@ -713,6 +736,24 @@ def main() -> None:
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--max-model-len", type=int, default=1024)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument(
+        "--limit-cube-num",
+        type=int,
+        default=12,
+        help=(
+            "AI cube cores applied to the default stream in 'baseline-nc-limit' "
+            "mode. -1 leaves the runtime default."
+        ),
+    )
+    parser.add_argument(
+        "--limit-vector-num",
+        type=int,
+        default=24,
+        help=(
+            "AI vector cores applied to the default stream in "
+            "'baseline-nc-limit' mode. -1 leaves the runtime default."
+        ),
+    )
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
@@ -743,7 +784,7 @@ def main() -> None:
     # scheduler config requires ``max_num_batched_tokens >= max_model_len``, so
     # bump the default accordingly; chunked baseline can keep the smaller value.
     default_mnt = max(P, B, args.max_num_seqs)
-    non_chunked = args.mode in ("baseline-nc", "pd", "both")
+    non_chunked = args.mode in ("baseline-nc", "baseline-nc-limit", "pd", "both")
     if args.max_num_batched_tokens is None:
         max_num_batched_tokens = default_mnt
         if non_chunked:
@@ -821,6 +862,53 @@ def main() -> None:
         )
         print(baseline_nc_result)
 
+    if mode in ("baseline-nc-limit", "both"):
+        print("== Building baseline-nc-limit worker (single-shot prefill, limited cores) ==")
+        baseline_nc_limit_worker = build_worker(
+            args.model,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            enable_pd=False,
+            enable_chunked_prefill=False,
+            block_size=args.block_size,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=args.enforce_eager,
+            profiler_config=profiler_config,
+        )
+        baseline_nc_limit_runner = baseline_nc_limit_worker.model_runner
+        # Apply the single default-stream core partition *after* the worker has
+        # finished capture/compile, right before measurement.  This mirrors the
+        # PD path, where ``set_stream_limit`` is applied once after capture.
+        apply_core_limit(
+            baseline_nc_limit_runner.device,
+            args.limit_cube_num,
+            args.limit_vector_num,
+        )
+
+        baseline_nc_limit_steps, baseline_nc_limit_reset = build_baseline_no_chunk_steps(
+            baseline_nc_limit_runner, P, B, D, sampling_params
+        )
+        _validate_steps_against_block_table(
+            baseline_nc_limit_runner, baseline_nc_limit_steps
+        )
+
+        print(
+            "\n== Baseline no-chunk limited-cores "
+            f"(cube={args.limit_cube_num}, vector={args.limit_vector_num}) =="
+        )
+        baseline_nc_limit_result = measure_scenario(
+            baseline_nc_limit_runner,
+            baseline_nc_limit_steps,
+            baseline_nc_limit_reset,
+            args.warmup,
+            args.iters,
+            args.profile,
+            baseline_nc_limit_worker,
+            "baseline-nc-limit",
+        )
+        print(baseline_nc_limit_result)
+
     if mode in ("pd", "both"):
         print("== Building PD worker (P/D dual-stream) ==")
         pd_worker = build_worker(
@@ -871,6 +959,14 @@ def main() -> None:
         baseline_nc_decode1 = baseline_nc_result["step1_mean_ms"]
         baseline_nc_prefill_plus_decode = baseline_nc_prefill + baseline_nc_decode1
 
+        # Baseline-nc-limit step layout: same as baseline-nc, but each step ran
+        # on a default stream whose core count is limited to one PD partition.
+        baseline_nc_limit_prefill = baseline_nc_limit_result["step0_mean_ms"]
+        baseline_nc_limit_decode1 = baseline_nc_limit_result["step1_mean_ms"]
+        baseline_nc_limit_prefill_plus_decode = (
+            baseline_nc_limit_prefill + baseline_nc_limit_decode1
+        )
+
         # PD step layout: [pioneer prefill, dual-stream1, dual-stream2, ...]
         pd_prefill_only = pd_result["step0_mean_ms"]
         pd_dual_stream = pd_result["step1_mean_ms"]
@@ -884,6 +980,18 @@ def main() -> None:
             f"baseline-nc prefill+decode (sequential): "
             f"{baseline_nc_prefill_plus_decode:.3f} ms"
         )
+        print(
+            f"baseline-nc-limit prefill(200, limited): "
+            f"{baseline_nc_limit_prefill:.3f} ms"
+        )
+        print(
+            f"baseline-nc-limit decode step (128 beams): "
+            f"{baseline_nc_limit_decode1:.3f} ms"
+        )
+        print(
+            f"baseline-nc-limit prefill+decode (sequential): "
+            f"{baseline_nc_limit_prefill_plus_decode:.3f} ms"
+        )
         print(f"pd          prefill-only (200)        : {pd_prefill_only:.3f} ms")
         print(f"pd          dual-stream step (P+D overlap): {pd_dual_stream:.3f} ms")
         print(
@@ -893,6 +1001,10 @@ def main() -> None:
         print(
             f"speedup vs sequential (no-chunk)      : "
             f"{baseline_nc_prefill_plus_decode / pd_dual_stream:.3f}x"
+        )
+        print(
+            f"speedup vs sequential (no-chunk, limited): "
+            f"{baseline_nc_limit_prefill_plus_decode / pd_dual_stream:.3f}x"
         )
 
 
