@@ -51,6 +51,7 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
+from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendMetadata
 from vllm_ascend.worker.model_runner_v1 import ExecuteModelState, NPUModelRunner
 from vllm_ascend.worker.pd_separation import (
@@ -194,6 +195,17 @@ class PDDualStreamModelRunner(NPUModelRunner):
         # ``validate_cudagraph_capturing_enabled`` and, after
         # ``profile_cudagraph_memory``, trip over the globally-disabled flag).
         self._dummy_run(self.max_num_reqs, cudagraph_runtime_mode=CUDAGraphMode.NONE)
+
+        # ``AttentionMaskBuilder`` is a singleton and builds its splitfuse mask
+        # lazily on first use via a CPU -> device copy
+        # (``get_splitfuse_attn_mask``).  The dummy run above passes NONE, which
+        # intentionally does *not* build attention metadata, so the mask is
+        # still cold here.  If it were left cold, the first call would happen
+        # inside ``torch.npu.graph`` on a non-default capture stream, and the
+        # host->device copy + ``rtStreamSynchronize`` is illegal during graph
+        # capture.  Pre-build it on the default stream so the capture path
+        # reuses the cached device tensor.
+        AttentionMaskBuilder(self.device).get_splitfuse_attn_mask()
 
     @staticmethod
     def _num_scheduled_tokens_for_capture(
