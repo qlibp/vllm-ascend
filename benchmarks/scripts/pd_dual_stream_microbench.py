@@ -1,0 +1,1018 @@
+#!/usr/bin/env python3
+"""Microbenchmark: native chunked-prefill vs P/D dual-stream compute time.
+
+This benchmark bypasses the scheduler entirely.  It constructs fake
+``SchedulerOutput`` objects and drives a worker's model runner directly through
+``execute_model()`` / ``sample_tokens()``, so the measured time is pure compute
+(prefill/decode forward + sampling + bookkeeping) without any scheduler or
+engine-loop overhead.
+
+Four scenarios are compared:
+
+* baseline      -- native vLLM chunked-prefill.  One 200-token prompt is split
+  into 128 + 72 token chunks and run *sequentially*, then 128 beams decode for
+  2 steps.
+* baseline-nc   -- native vLLM single-shot prefill.  The same 200-token prompt
+  is prefilled in one step (no chunking), then 128 beams decode for 2 steps.
+* baseline-nc-limit -- same steps as ``baseline-nc``, but the default stream's
+  AI-core count is limited via ``torch_npu.npu.set_stream_limit`` to match a
+  single P/D stream's partition, so the sequential prefill+decode time can be
+  compared against the dual-stream overlap.
+* pd            -- P/D dual-stream.  A pioneer prefill runs alone, then the
+  next prefill and the pioneer's 128-beam decode run *concurrently* on two
+  streams.
+
+KV-cache data is intentionally NOT meaningful here.  The block ids are just
+monotonic integers; only the compute amount (num prefill tokens, num decode
+tokens, num requests) matches the target scenario.
+
+Usage:
+    # Recommended: run each scenario in its own process (clean device state).
+    python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode baseline
+    python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode baseline-nc
+    python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode baseline-nc-limit
+    python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode pd
+
+    # Or run all back-to-back in one process (needs ~4x device memory).
+    python benchmarks/scripts/pd_dual_stream_microbench.py --model <model> --mode both \
+        --profile --profile-dir /tmp/pd_traces
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import os
+import statistics
+import time
+from dataclasses import dataclass
+from math import ceil
+
+import torch
+import torch_npu
+
+from vllm.config import ProfilerConfig, set_current_vllm_config
+from vllm.engine.arg_utils import EngineArgs
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    NewRequestData,
+    SchedulerOutput,
+)
+
+from vllm_ascend.worker.worker import NPUWorker
+
+
+def _cdiv(a: int, b: int) -> int:
+    return ceil(a / b)
+
+
+def get_runner_block_size(runner) -> int:
+    """Return the KV-cache manager block size actually used by ``runner``.
+
+    ``cache_config.block_size`` (what the CLI ``--block-size`` controls) is only
+    the requested page size.  On Ascend the attention backend may select a
+    different common block size (``select_common_block_size``), and
+    ``kv_cache_spec.block_size`` ends up being the value the block table is
+    actually sized with.  We must allocate fake block ids in units of that
+    value, otherwise ``BlockTable.append_row`` overruns a row and raises
+    ``ValueError: could not broadcast ... into shape (0,)``.
+    """
+    return runner.input_batch.block_table.block_tables[0].physical_block_size
+
+
+def get_runner_max_blocks_per_req(runner) -> int:
+    """Return the maximum number of physical blocks one request may occupy.
+
+    This is the block-table row width in physical-block units and is the hard
+    upper bound on ``len(block_ids)`` for any single request.  It is derived
+    from ``max_model_len`` and ``kv_cache_spec.block_size``, but reading it
+    directly avoids any mismatch with ``runner.max_model_len``.
+    """
+    return runner.input_batch.block_table.block_tables[0].max_num_blocks_per_req
+
+
+def _check_request_fits(runner, P: int, D: int) -> None:
+    """Fail fast instead of hitting an obscure block-table broadcast error.
+
+    The block-table row has exactly ``max_num_blocks_per_req`` physical-block
+    slots.  A request spanning ``P`` prompt tokens plus ``D`` output tokens needs
+    ``cdiv(P + D, block_size)`` blocks, so that value must not exceed the row
+    width.
+    """
+    block_size = get_runner_block_size(runner)
+    max_blocks = get_runner_max_blocks_per_req(runner)
+    needed = _cdiv(P + D, block_size)
+    if needed > max_blocks:
+        raise ValueError(
+            f"scenario does not fit in the model's KV-cache block table: "
+            f"prefill_len + output_tokens = {P + D} tokens needs {needed} blocks "
+            f"(block_size={block_size}), but max_num_blocks_per_req is "
+            f"{max_blocks}. Reduce --prefill-len / --output-tokens, or increase "
+            f"--max-model-len."
+        )
+
+
+def _validate_steps_against_block_table(runner, steps: list[SchedulerOutput]) -> None:
+    """Validate every fake ``SchedulerOutput`` against the *actual* block table.
+
+    ``BlockTable.append_row``/``add_row`` write into a buffer whose row width is
+    ``block_table.np.shape[1]``.  In hybrid-block mode one physical block id is
+    expanded into ``blocks_per_phys_block`` logical ids before the write, so we
+    replicate that here.  This is the exact condition that otherwise surfaces as
+    the opaque ``ValueError: could not broadcast input array from shape (X,)
+    into shape (Y,)``.
+    """
+    block_tables = runner.input_batch.block_table.block_tables
+
+    for gid, bt in enumerate(block_tables):
+        row_width = int(bt.block_table.np.shape[1])
+        bpp = int(getattr(bt, "blocks_per_phys_block", 1))
+        physical_capacity = row_width // bpp
+        use_hybrid = bool(getattr(bt, "use_hybrid_blocks", False))
+
+        print(
+            f"[validate] group={gid} block_table.np.shape={tuple(bt.block_table.np.shape)} "
+            f"physical_block_size={getattr(bt, 'physical_block_size', None)} "
+            f"max_num_blocks_per_req={getattr(bt, 'max_num_blocks_per_req', None)} "
+            f"kernel_block_size={getattr(bt, 'block_size', None)} "
+            f"blocks_per_phys_block={bpp} use_hybrid_blocks={use_hybrid} "
+            f"=> physical_capacity={physical_capacity} row_width={row_width}"
+        )
+
+        # Per-request accumulated physical-block count, mirroring
+        # ``num_blocks_per_row`` + ``append_row``/``add_row`` across steps.
+        acc: dict[str, int] = {}
+
+        for step_idx, so in enumerate(steps):
+            for req in so.scheduled_new_reqs:
+                blocks = req.block_ids[gid]
+                acc[req.req_id] = len(blocks)
+                logical_len = len(blocks) * bpp
+                if logical_len > row_width:
+                    raise ValueError(
+                        f"step {step_idx}: new request {req.req_id!r} has "
+                        f"{len(blocks)} physical blocks -> {logical_len} logical "
+                        f"blocks, but block-table group {gid} row width is "
+                        f"{row_width}. (physical_block_size={bt.physical_block_size}, "
+                        f"blocks_per_phys_block={bpp})"
+                    )
+
+            cached = so.scheduled_cached_reqs
+            for i, req_id in enumerate(cached.req_ids):
+                new_ids = cached.new_block_ids[i]
+                if new_ids is None:
+                    continue
+                new_blocks = new_ids[gid]
+                prev = acc.get(req_id, 0)
+                acc[req_id] = prev + len(new_blocks)
+                logical_len = acc[req_id] * bpp
+                if logical_len > row_width:
+                    raise ValueError(
+                        f"step {step_idx}: cached request {req_id!r} grows to "
+                        f"{acc[req_id]} physical blocks -> {logical_len} logical "
+                        f"blocks, but block-table group {gid} row width is "
+                        f"{row_width}. (previous={prev}, appended={len(new_blocks)}, "
+                        f"physical_block_size={bt.physical_block_size}, "
+                        f"blocks_per_phys_block={bpp})"
+                    )
+
+
+@dataclass
+class BlockAlloc:
+    """Monotonic block-id allocator.  Correctness of KV data is irrelevant;
+    only the ids must be valid non-negative integers so slot_mapping stays in
+    range."""
+
+    base: int = 0
+    next_id: int = 0
+
+    def __post_init__(self) -> None:
+        self.next_id = self.base
+
+    def alloc(self, n: int) -> list[int]:
+        ids = list(range(self.next_id, self.next_id + n))
+        self.next_id += n
+        return ids
+
+
+def make_new_prefill(
+    req_id: str,
+    prompt_len: int,
+    num_scheduled: int,
+    num_computed: int,
+    blocks: list[int],
+    sampling_params: SamplingParams,
+) -> NewRequestData:
+    """Build a prefill NewRequestData (num_scheduled > 1)."""
+    return NewRequestData(
+        req_id=req_id,
+        prompt_token_ids=[1] * prompt_len,
+        mm_features=[],
+        sampling_params=sampling_params,
+        pooling_params=None,
+        block_ids=(blocks,),
+        num_computed_tokens=num_computed,
+        lora_request=None,
+    )
+
+
+def make_new_decode(
+    req_id: str,
+    prompt_len: int,
+    num_computed: int,
+    blocks: list[int],
+    sampling_params: SamplingParams,
+) -> NewRequestData:
+    """Build a decode NewRequestData.
+
+    ``prompt_len`` is the prompt length P.  We append one dummy output token so
+    that ``num_computed == P`` reads a valid token at index P (the first
+    generated token).  This request is scheduled with ``num_scheduled_tokens=1``
+    and is therefore classified as decode by ``split_prefill_decode``.
+    """
+    return NewRequestData(
+        req_id=req_id,
+        prompt_token_ids=[1] * (prompt_len + 1),
+        mm_features=[],
+        sampling_params=sampling_params,
+        pooling_params=None,
+        block_ids=(blocks,),
+        num_computed_tokens=num_computed,
+        lora_request=None,
+    )
+
+
+def make_cached(
+    req_ids: list[str],
+    num_computed_list: list[int],
+    new_block_ids_list: list[tuple[list[int], ...] | None],
+    num_output_tokens_list: list[int],
+) -> CachedRequestData:
+    return CachedRequestData(
+        req_ids=list(req_ids),
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=list(new_block_ids_list),
+        num_computed_tokens=list(num_computed_list),
+        num_output_tokens=list(num_output_tokens_list),
+    )
+
+
+def make_scheduler_output(
+    runner,
+    new_reqs: list[NewRequestData],
+    cached_reqs: CachedRequestData,
+    num_scheduled_tokens: dict[str, int],
+    finished: set[str] | None = None,
+) -> SchedulerOutput:
+    num_groups = len(runner.attn_groups)
+    return SchedulerOutput(
+        scheduled_new_reqs=new_reqs,
+        scheduled_cached_reqs=cached_reqs,
+        num_scheduled_tokens=dict(num_scheduled_tokens),
+        total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[0] * num_groups,
+        finished_req_ids=set(finished or ()),
+        free_encoder_mm_hashes=[],
+    )
+
+
+def build_worker(
+    model: str,
+    *,
+    max_num_batched_tokens: int,
+    max_num_seqs: int,
+    enable_pd: bool,
+    enable_chunked_prefill: bool,
+    block_size: int,
+    max_model_len: int,
+    gpu_memory_utilization: float,
+    enforce_eager: bool,
+    profiler_config: ProfilerConfig | None,
+) -> NPUWorker:
+    """Build a fully initialized worker following the vllm_ascend lifecycle."""
+    # Single-process benchmark: ``NPUWorker`` initializes torch.distributed with
+    # ``init_method="env://"``, which still requires MASTER_ADDR / MASTER_PORT /
+    # RANK / WORLD_SIZE even when world_size == 1.  Provide sane defaults without
+    # overriding values the caller may have already exported.
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+
+    # Must be set before config creation: PDSeparationConfig is read from env
+    # inside PDDualStreamModelRunner.__init__ and SchedulerPDSeparation.
+    os.environ["VLLM_ASCEND_ENABLE_PD_SEPARATION"] = "1" if enable_pd else "0"
+
+    engine_args = EngineArgs(
+        model=model,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_seqs=max_num_seqs,
+        max_model_len=max_model_len,
+        block_size=block_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enforce_eager=enforce_eager,
+        enable_prefix_caching=False,
+        enable_chunked_prefill=enable_chunked_prefill,
+    )
+    if profiler_config is not None:
+        engine_args.profiler_config = profiler_config
+
+    vllm_config = engine_args.create_engine_config()
+
+    # Normal vLLM goes through WorkerWrapperBase, which wraps init_device /
+    # load_model / initialize_from_config in ``set_current_vllm_config(...)``.
+    # We instantiate NPUWorker directly, so replicate that here; otherwise HCCL
+    # pg-option setup calls get_current_vllm_config() and raises AssertionError.
+    with set_current_vllm_config(vllm_config):
+        worker = NPUWorker(
+            vllm_config=vllm_config,
+            local_rank=0,
+            rank=0,
+            distributed_init_method="env://",
+            is_driver_worker=True,
+        )
+        worker.init_device()
+        worker.load_model()
+
+        available_memory = worker.determine_available_memory()
+        kv_cache_spec = worker.model_runner.get_kv_cache_spec()
+        kv_cache_config = get_kv_cache_configs(
+            vllm_config, [kv_cache_spec], [available_memory]
+        )[0]
+        worker.initialize_from_config(kv_cache_config)
+        worker.compile_or_warm_up_model()
+
+    return worker
+
+
+def run_step(runner, scheduler_output: SchedulerOutput):
+    """Run one step, handling the async execute_model/sample_tokens split.
+
+    The baseline runner (NPUModelRunner) runs forward + sampling inside
+    ``execute_model`` and returns a ModelRunnerOutput, leaving
+    ``execute_model_state`` as None.  The PD runner returns None and stores the
+    state, so ``sample_tokens`` must be called afterwards.
+    """
+    out = runner.execute_model(scheduler_output)
+    if getattr(runner, "execute_model_state", None) is not None:
+        out = runner.sample_tokens(None)
+    return out
+
+
+def timed_step(runner, scheduler_output: SchedulerOutput) -> float:
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    run_step(runner, scheduler_output)
+    torch.npu.synchronize()
+    t1 = time.perf_counter()
+    return (t1 - t0) * 1e3  # ms
+
+
+def apply_core_limit(device: torch.device, cube_num: int, vector_num: int) -> None:
+    """Limit AI cores on the default NPU stream.
+
+    Used by the ``baseline-nc-limit`` scenario to run the baseline runner with
+    the same per-stream core partition as a single P/D stream (see
+    ``PDStreamContext.apply_stream_limit``).  The baseline runner executes both
+    prefill and decode on the default stream, so a single partition is applied
+    to every step.  A value of ``-1`` for either count leaves that resource on
+    the runtime default.
+    """
+    if cube_num < 0 and vector_num < 0:
+        return
+    stream = torch.npu.default_stream(device)
+    print(f"[core-limit] default stream cube_num={cube_num} vector_num={vector_num}")
+    torch_npu.npu.set_stream_limit(stream, cube_num=cube_num, vector_num=vector_num)
+    stream_limit = torch_npu.npu.get_stream_limit(stream)
+    print(
+        f"[core-limit] default stream actual limit: "
+        f"cube_core_num={stream_limit.get('cube_core_num')} "
+        f"vector_core_num={stream_limit.get('vector_core_num')}"
+    )
+
+
+def reset_runner(runner, req_ids: set[str]) -> None:
+    if not req_ids:
+        return
+    so = SchedulerOutput.make_empty()
+    so.finished_req_ids = set(req_ids)
+    runner.execute_model(so)
+
+
+# --------------------------------------------------------------------------- #
+# Scenario step builders
+# --------------------------------------------------------------------------- #
+def _append_decode_steps(
+    runner,
+    steps: list[SchedulerOutput],
+    blk: BlockAlloc,
+    P: int,
+    B: int,
+    D: int,
+    sampling_params: SamplingParams,
+    prefix_blocks: tuple[int, ...],
+    finished_req_id: str,
+) -> set[str]:
+    """Append the decode steps shared by both baseline variants.
+
+    The first decode step fans out the finished prefill request into ``B`` new
+    beams; subsequent steps continue decoding those beams.  Returns the set of
+    beam request ids that need to be reset between iterations.
+    """
+    block_size = get_runner_block_size(runner)
+    nblocks = lambda t: _cdiv(t, block_size)
+
+    # First decode step -> B new beams, the prefill request is finished.
+    #
+    # Block-id sharing: each beam reuses the shared prompt ``prefix_blocks``
+    # (prefix-cache semantics, read-only during decode) and appends its own
+    # newly allocated output blocks.  ``blk.alloc()`` is called inside the loop,
+    # so when ``first_output_blocks > 0`` every beam gets a *distinct* output
+    # block and writes to different physical slots.
+    #
+    # However, when ``first_output_blocks == 0`` (e.g. the default P=200 with
+    # block_size=16: nblocks(201) == nblocks(200) == 13), the first generated
+    # token still falls inside the last shared prompt block.  In that case all
+    # B beams write their first output token into the *same* physical block/slot,
+    # overwriting each other's KV.  This is a KV-data collision, not a bug for
+    # this benchmark: KV correctness is intentionally ignored here (see module
+    # docstring), and slot collisions do not change the measured compute amount.
+    first_output_blocks = nblocks(P + 1) - nblocks(P)
+    new_reqs = []
+    for i in range(B):
+        blocks = list(prefix_blocks) + blk.alloc(first_output_blocks)
+        new_reqs.append(make_new_decode(f"d{i}", P, P, blocks, sampling_params))
+    num_sched = {f"d{i}": 1 for i in range(B)}
+    steps.append(
+        make_scheduler_output(
+            runner,
+            new_reqs,
+            CachedRequestData.make_empty(),
+            num_sched,
+            finished={finished_req_id},
+        )
+    )
+
+    # Remaining decode steps (D - 1 = 1 by default).  Allocate only the blocks
+    # newly required when advancing from ``P + step`` to ``P + step + 1`` tokens.
+    #
+    # Same sharing note as above: when ``step_blocks == 0`` (the default P=200,
+    # D=2 keeps every output token inside the last prompt block), each beam's
+    # generated token again lands in the shared prompt block and collides.  This
+    # is acceptable here because KV data is not meaningful for this benchmark.
+    beam_ids = [f"d{i}" for i in range(B)]
+    for step in range(1, D):
+        step_blocks = nblocks(P + step + 1) - nblocks(P + step)
+        steps.append(
+            make_scheduler_output(
+                runner,
+                [],
+                make_cached(
+                    beam_ids,
+                    [P + step] * B,
+                    [(blk.alloc(step_blocks),) for _ in range(B)],
+                    [step] * B,
+                ),
+                num_sched,
+            )
+        )
+
+    return set(beam_ids)
+
+
+def build_baseline_steps(
+    runner,
+    P: int,
+    B: int,
+    D: int,
+    chunk: int,
+    sampling_params: SamplingParams,
+) -> tuple[list[SchedulerOutput], set[str]]:
+    """Native chunked-prefill, prefill chunks then decode, all sequential."""
+    _check_request_fits(runner, P, D)
+    block_size = get_runner_block_size(runner)
+    blk = BlockAlloc()
+    nblocks = lambda t: _cdiv(t, block_size)
+    steps: list[SchedulerOutput] = []
+
+    # Split the prompt into ceil(P / chunk) chunks.  Allocate only the blocks
+    # newly needed for each chunk (delta of total-token block counts) so the
+    # final request uses exactly nblocks(P) blocks instead of over-counting at
+    # chunk boundaries.
+    r0_blocks: list[int] = []
+    computed = 0
+    first = True
+    while computed < P:
+        chunk_len = min(chunk, P - computed)
+        new_blocks = blk.alloc(nblocks(computed + chunk_len) - nblocks(computed))
+        if first:
+            steps.append(
+                make_scheduler_output(
+                    runner,
+                    [make_new_prefill("r0", P, chunk_len, 0, new_blocks, sampling_params)],
+                    CachedRequestData.make_empty(),
+                    {"r0": chunk_len},
+                )
+            )
+            first = False
+        else:
+            steps.append(
+                make_scheduler_output(
+                    runner,
+                    [],
+                    make_cached(
+                        ["r0"],
+                        [computed],
+                        [(new_blocks,)],
+                        [0],
+                    ),
+                    {"r0": chunk_len},
+                )
+            )
+        r0_blocks += new_blocks
+        computed += chunk_len
+
+    beam_ids = _append_decode_steps(
+        runner, steps, blk, P, B, D, sampling_params, tuple(r0_blocks), "r0"
+    )
+    return steps, beam_ids
+
+
+def build_baseline_no_chunk_steps(
+    runner,
+    P: int,
+    B: int,
+    D: int,
+    sampling_params: SamplingParams,
+) -> tuple[list[SchedulerOutput], set[str]]:
+    """Native single-shot prefill (no chunking), then decode, all sequential."""
+    _check_request_fits(runner, P, D)
+    block_size = get_runner_block_size(runner)
+    blk = BlockAlloc()
+    nblocks = lambda t: _cdiv(t, block_size)
+    steps: list[SchedulerOutput] = []
+
+    # Single full prefill, scheduled as one step.
+    r0_blocks = blk.alloc(nblocks(P))
+    steps.append(
+        make_scheduler_output(
+            runner,
+            [make_new_prefill("r0", P, P, 0, r0_blocks, sampling_params)],
+            CachedRequestData.make_empty(),
+            {"r0": P},
+        )
+    )
+
+    beam_ids = _append_decode_steps(
+        runner, steps, blk, P, B, D, sampling_params, tuple(r0_blocks), "r0"
+    )
+    return steps, beam_ids
+
+
+def build_pd_steps(
+    runner,
+    P: int,
+    B: int,
+    D: int,
+    sampling_params: SamplingParams,
+) -> tuple[list[SchedulerOutput], set[str]]:
+    """P/D dual-stream timeline.
+
+    B0: pioneer prefill A alone.
+    B1: A's 128-beam decode + prefill B in dual-stream.
+    B2 (optional): A's beams decode + prefill C in dual-stream.
+    """
+    _check_request_fits(runner, P, D)
+    block_size = get_runner_block_size(runner)
+    blk = BlockAlloc()
+    nblocks = lambda t: _cdiv(t, block_size)
+    steps: list[SchedulerOutput] = []
+
+    # B0: pioneer prefill.
+    A_blocks = blk.alloc(nblocks(P))
+    steps.append(
+        make_scheduler_output(
+            runner,
+            [make_new_prefill("A", P, P, 0, A_blocks, sampling_params)],
+            CachedRequestData.make_empty(),
+            {"A": P},
+        )
+    )
+
+    beam_ids = [f"d{i}" for i in range(B)]
+    prefix_blocks = tuple(A_blocks)
+
+    # B1: dual-stream step -- 128 new decode beams + a new prefill B.
+    # Beams share ``prefix_blocks`` (nblocks(P)) and add only the blocks needed
+    # for their first output token.
+    first_output_blocks = nblocks(P + 1) - nblocks(P)
+    new_reqs = []
+    for i in range(B):
+        blocks = list(prefix_blocks) + blk.alloc(first_output_blocks)
+        new_reqs.append(make_new_decode(f"d{i}", P, P, blocks, sampling_params))
+    B_blocks = blk.alloc(nblocks(P))
+    new_reqs.append(make_new_prefill("B", P, P, 0, B_blocks, sampling_params))
+
+    num_sched = {f"d{i}": 1 for i in range(B)}
+    num_sched["B"] = P
+    steps.append(
+        make_scheduler_output(
+            runner,
+            new_reqs,
+            CachedRequestData.make_empty(),
+            num_sched,
+            finished={"A"},
+        )
+    )
+
+    # Remaining decode steps, each overlapped with one more prefill.
+    pending_prefill = "B"
+    for step in range(1, D):
+        next_prefill = f"P{step}"
+        p_blocks = blk.alloc(nblocks(P))
+        new_reqs = [make_new_prefill(next_prefill, P, P, 0, p_blocks, sampling_params)]
+        num_sched = {f"d{i}": 1 for i in range(B)}
+        num_sched[next_prefill] = P
+        step_blocks = nblocks(P + step + 1) - nblocks(P + step)
+        steps.append(
+            make_scheduler_output(
+                runner,
+                new_reqs,
+                make_cached(
+                    beam_ids,
+                    [P + step] * B,
+                    [(blk.alloc(step_blocks),) for _ in range(B)],
+                    [step] * B,
+                ),
+                num_sched,
+                finished={pending_prefill},
+            )
+        )
+        pending_prefill = next_prefill
+
+    # At the end the beams and the last injected prefill are still resident.
+    return steps, set(beam_ids) | {pending_prefill}
+
+
+# --------------------------------------------------------------------------- #
+# Measurement
+# --------------------------------------------------------------------------- #
+def measure_scenario(
+    runner,
+    steps: list[SchedulerOutput],
+    req_ids_to_reset: set[str],
+    warmup: int,
+    iters: int,
+    profile: bool,
+    worker: NPUWorker,
+    profile_prefix: str,
+) -> dict[str, float]:
+    # Warmup.
+    for _ in range(warmup):
+        for so in steps:
+            # ``_update_states`` extends ``req_state.block_ids`` in place, and
+            # those lists are the same objects stored in ``so``.  Reusing ``so``
+            # across iterations would grow the lists every iteration and
+            # eventually overflow the block-table row width.  Deep-copy the step
+            # so each iteration starts from the original (fixed) block ids.
+            run_step(runner, copy.deepcopy(so))
+        reset_runner(runner, req_ids_to_reset)
+
+    step_times: list[list[float]] = [[] for _ in steps]
+    totals: list[float] = []
+    for _ in range(iters):
+        # Profile only the benchmark steps.  ``reset_runner`` below must stay
+        # outside the profiled window; otherwise every iteration's cleanup
+        # ``execute_model`` would also be recorded in the trace.  The runner is
+        # already clean at the top of each iteration: the first iteration starts
+        # from the post-warmup clean state, and every later iteration was reset
+        # at the bottom of the previous one.
+        if profile:
+            worker.profile(is_start=True, profile_prefix=profile_prefix)
+
+        it_total = 0.0
+        for idx, so in enumerate(steps):
+            # Deep-copy before starting the timer so clone cost is not measured.
+            dt = timed_step(runner, copy.deepcopy(so))
+            step_times[idx].append(dt)
+            it_total += dt
+        totals.append(it_total)
+
+        if profile:
+            worker.profile(is_start=False)
+
+        reset_runner(runner, req_ids_to_reset)
+
+    result: dict[str, float] = {
+        "total_mean_ms": statistics.mean(totals),
+        "total_median_ms": statistics.median(totals),
+    }
+    for idx, times in enumerate(step_times):
+        result[f"step{idx}_mean_ms"] = statistics.mean(times)
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True, help="HuggingFace model id or path")
+    parser.add_argument(
+        "--mode",
+        choices=["baseline", "baseline-nc", "baseline-nc-limit", "pd", "both"],
+        default="both",
+        help=(
+            "Which scenario to run. 'baseline', 'baseline-nc', "
+            "'baseline-nc-limit' and 'pd' run a single scenario in this process "
+            "(recommended for clean memory/device state); 'both' runs all "
+            "scenarios back-to-back in one process for a direct comparison."
+        ),
+    )
+    parser.add_argument("--prefill-len", type=int, default=200)
+    parser.add_argument("--beam-width", type=int, default=128)
+    parser.add_argument("--output-tokens", type=int, default=2)
+    parser.add_argument("--chunk-size", type=int, default=128, help="baseline chunk size")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
+    parser.add_argument("--max-num-seqs", type=int, default=256)
+    parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--max-model-len", type=int, default=1024)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument(
+        "--limit-cube-num",
+        type=int,
+        default=12,
+        help=(
+            "AI cube cores applied to the default stream in 'baseline-nc-limit' "
+            "mode. -1 leaves the runtime default."
+        ),
+    )
+    parser.add_argument(
+        "--limit-vector-num",
+        type=int,
+        default=24,
+        help=(
+            "AI vector cores applied to the default stream in "
+            "'baseline-nc-limit' mode. -1 leaves the runtime default."
+        ),
+    )
+    parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-dir", type=str, default="/tmp/pd_dual_stream_traces")
+    args = parser.parse_args()
+
+    P = args.prefill_len
+    B = args.beam_width
+    D = args.output_tokens
+    assert D >= 1, "output-tokens must be >= 1"
+    if args.mode in ("baseline", "both"):
+        assert P > args.chunk_size, "prefill-len must be > chunk-size for chunked baseline"
+
+    sampling_params = SamplingParams(n=1, temperature=0.0)
+
+    profiler_config = None
+    if args.profile:
+        os.makedirs(args.profile_dir, exist_ok=True)
+        profiler_config = ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir=os.path.abspath(args.profile_dir),
+        )
+
+    # ``max_num_batched_tokens`` is the runner's buffer capacity.  The baseline
+    # chunk size is controlled independently by --chunk-size in the fake
+    # SchedulerOutput below.  For non-chunked scenarios (baseline-nc / pd) the
+    # scheduler config requires ``max_num_batched_tokens >= max_model_len``, so
+    # bump the default accordingly; chunked baseline can keep the smaller value.
+    default_mnt = max(P, B, args.max_num_seqs)
+    non_chunked = args.mode in ("baseline-nc", "baseline-nc-limit", "pd", "both")
+    if args.max_num_batched_tokens is None:
+        max_num_batched_tokens = default_mnt
+        if non_chunked:
+            max_num_batched_tokens = max(max_num_batched_tokens, args.max_model_len)
+    else:
+        max_num_batched_tokens = args.max_num_batched_tokens
+
+    mode = args.mode
+
+    if mode in ("baseline", "both"):
+        print("== Building baseline worker (native chunked prefill) ==")
+        baseline_worker = build_worker(
+            args.model,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            enable_pd=False,
+            enable_chunked_prefill=True,
+            block_size=args.block_size,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=args.enforce_eager,
+            profiler_config=profiler_config,
+        )
+        baseline_runner = baseline_worker.model_runner
+
+        baseline_steps, baseline_reset = build_baseline_steps(
+            baseline_runner, P, B, D, args.chunk_size, sampling_params
+        )
+        _validate_steps_against_block_table(baseline_runner, baseline_steps)
+
+        print("\n== Baseline (chunked prefill) ==")
+        baseline_result = measure_scenario(
+            baseline_runner,
+            baseline_steps,
+            baseline_reset,
+            args.warmup,
+            args.iters,
+            args.profile,
+            baseline_worker,
+            "baseline",
+        )
+        print(baseline_result)
+
+    if mode in ("baseline-nc", "both"):
+        print("== Building baseline-nc worker (single-shot prefill) ==")
+        baseline_nc_worker = build_worker(
+            args.model,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            enable_pd=False,
+            enable_chunked_prefill=False,
+            block_size=args.block_size,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=args.enforce_eager,
+            profiler_config=profiler_config,
+        )
+        baseline_nc_runner = baseline_nc_worker.model_runner
+
+        baseline_nc_steps, baseline_nc_reset = build_baseline_no_chunk_steps(
+            baseline_nc_runner, P, B, D, sampling_params
+        )
+        _validate_steps_against_block_table(baseline_nc_runner, baseline_nc_steps)
+
+        print("\n== Baseline no-chunk (single-shot prefill) ==")
+        baseline_nc_result = measure_scenario(
+            baseline_nc_runner,
+            baseline_nc_steps,
+            baseline_nc_reset,
+            args.warmup,
+            args.iters,
+            args.profile,
+            baseline_nc_worker,
+            "baseline-nc",
+        )
+        print(baseline_nc_result)
+
+    if mode in ("baseline-nc-limit", "both"):
+        print("== Building baseline-nc-limit worker (single-shot prefill, limited cores) ==")
+        baseline_nc_limit_worker = build_worker(
+            args.model,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            enable_pd=False,
+            enable_chunked_prefill=False,
+            block_size=args.block_size,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=args.enforce_eager,
+            profiler_config=profiler_config,
+        )
+        baseline_nc_limit_runner = baseline_nc_limit_worker.model_runner
+        # Apply the single default-stream core partition *after* the worker has
+        # finished capture/compile, right before measurement.  This mirrors the
+        # PD path, where ``set_stream_limit`` is applied once after capture.
+        apply_core_limit(
+            baseline_nc_limit_runner.device,
+            args.limit_cube_num,
+            args.limit_vector_num,
+        )
+
+        baseline_nc_limit_steps, baseline_nc_limit_reset = build_baseline_no_chunk_steps(
+            baseline_nc_limit_runner, P, B, D, sampling_params
+        )
+        _validate_steps_against_block_table(
+            baseline_nc_limit_runner, baseline_nc_limit_steps
+        )
+
+        print(
+            "\n== Baseline no-chunk limited-cores "
+            f"(cube={args.limit_cube_num}, vector={args.limit_vector_num}) =="
+        )
+        baseline_nc_limit_result = measure_scenario(
+            baseline_nc_limit_runner,
+            baseline_nc_limit_steps,
+            baseline_nc_limit_reset,
+            args.warmup,
+            args.iters,
+            args.profile,
+            baseline_nc_limit_worker,
+            "baseline-nc-limit",
+        )
+        print(baseline_nc_limit_result)
+
+    if mode in ("pd", "both"):
+        print("== Building PD worker (P/D dual-stream) ==")
+        pd_worker = build_worker(
+            args.model,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            enable_pd=True,
+            enable_chunked_prefill=False,
+            block_size=args.block_size,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=args.enforce_eager,
+            profiler_config=profiler_config,
+        )
+        pd_runner = pd_worker.model_runner
+
+        pd_steps, pd_reset = build_pd_steps(
+            pd_runner, P, B, D, sampling_params
+        )
+        _validate_steps_against_block_table(pd_runner, pd_steps)
+
+        print("\n== PD dual-stream ==")
+        pd_result = measure_scenario(
+            pd_runner,
+            pd_steps,
+            pd_reset,
+            args.warmup,
+            args.iters,
+            args.profile,
+            pd_worker,
+            "pd",
+        )
+        print(pd_result)
+
+    if mode == "both":
+        print("\n== Summary ==")
+
+        # Baseline step layout: [prefill chunk0..k-1, decode1, decode2, ...]
+        n_prefill_steps = _cdiv(P, args.chunk_size)
+        baseline_prefill = sum(
+            baseline_result[f"step{i}_mean_ms"] for i in range(n_prefill_steps)
+        )
+        baseline_decode1 = baseline_result[f"step{n_prefill_steps}_mean_ms"]
+        baseline_prefill_plus_decode = baseline_prefill + baseline_decode1
+
+        # Baseline-nc step layout: [prefill, decode1, decode2, ...]
+        baseline_nc_prefill = baseline_nc_result["step0_mean_ms"]
+        baseline_nc_decode1 = baseline_nc_result["step1_mean_ms"]
+        baseline_nc_prefill_plus_decode = baseline_nc_prefill + baseline_nc_decode1
+
+        # Baseline-nc-limit step layout: same as baseline-nc, but each step ran
+        # on a default stream whose core count is limited to one PD partition.
+        baseline_nc_limit_prefill = baseline_nc_limit_result["step0_mean_ms"]
+        baseline_nc_limit_decode1 = baseline_nc_limit_result["step1_mean_ms"]
+        baseline_nc_limit_prefill_plus_decode = (
+            baseline_nc_limit_prefill + baseline_nc_limit_decode1
+        )
+
+        # PD step layout: [pioneer prefill, dual-stream1, dual-stream2, ...]
+        pd_prefill_only = pd_result["step0_mean_ms"]
+        pd_dual_stream = pd_result["step1_mean_ms"]
+
+        print(f"baseline    prefill(200, chunked)     : {baseline_prefill:.3f} ms")
+        print(f"baseline    decode step (128 beams)   : {baseline_decode1:.3f} ms")
+        print(f"baseline    prefill+decode (sequential): {baseline_prefill_plus_decode:.3f} ms")
+        print(f"baseline-nc prefill(200, single-shot) : {baseline_nc_prefill:.3f} ms")
+        print(f"baseline-nc decode step (128 beams)   : {baseline_nc_decode1:.3f} ms")
+        print(
+            f"baseline-nc prefill+decode (sequential): "
+            f"{baseline_nc_prefill_plus_decode:.3f} ms"
+        )
+        print(
+            f"baseline-nc-limit prefill(200, limited): "
+            f"{baseline_nc_limit_prefill:.3f} ms"
+        )
+        print(
+            f"baseline-nc-limit decode step (128 beams): "
+            f"{baseline_nc_limit_decode1:.3f} ms"
+        )
+        print(
+            f"baseline-nc-limit prefill+decode (sequential): "
+            f"{baseline_nc_limit_prefill_plus_decode:.3f} ms"
+        )
+        print(f"pd          prefill-only (200)        : {pd_prefill_only:.3f} ms")
+        print(f"pd          dual-stream step (P+D overlap): {pd_dual_stream:.3f} ms")
+        print(
+            f"speedup vs sequential (chunked)       : "
+            f"{baseline_prefill_plus_decode / pd_dual_stream:.3f}x"
+        )
+        print(
+            f"speedup vs sequential (no-chunk)      : "
+            f"{baseline_nc_prefill_plus_decode / pd_dual_stream:.3f}x"
+        )
+        print(
+            f"speedup vs sequential (no-chunk, limited): "
+            f"{baseline_nc_limit_prefill_plus_decode / pd_dual_stream:.3f}x"
+        )
+
+
+if __name__ == "__main__":
+    main()

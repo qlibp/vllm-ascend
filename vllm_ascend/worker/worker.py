@@ -72,6 +72,7 @@ from vllm_ascend.utils import (
     setup_ascend_local_comm_res,
     vllm_version_is,
 )
+from vllm_ascend import envs
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
@@ -516,6 +517,10 @@ class NPUWorker(WorkerBase):
             from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 
             self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
+        elif envs.VLLM_ASCEND_ENABLE_PD_SEPARATION:
+            from vllm_ascend.worker.model_runner_pd import PDDualStreamModelRunner
+
+            self.model_runner = PDDualStreamModelRunner(self.vllm_config, self.device)
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
