@@ -40,16 +40,18 @@ submits the pre-captured `model_ri` to the current stream:
   (`AclmdlRIExecuteAsync`, no re-tiling).
 
 Therefore a limit set on the **replay** stream after capture is a no-op for the
-captured graph. The P/D code does exactly this:
-
-- `vllm_ascend/worker/pd_separation.py:334-335` calls `apply_stream_limit()`
-  after capture, and `apply_stream_limit()` targets `self.stream` (replay), not
-  `self.capture_stream` (`pd_separation.py:217-231`).
+captured graph. This is exactly the bug test02 confirmed in the original P/D
+code: it called `apply_stream_limit()` after capture and targeted
+`self.stream` (replay), not `self.capture_stream`.
 
 To bake a core partition into a graph, `set_stream_limit` must be applied to
 the **capture** stream **before** `torch.npu.graph(...)`. `torch_npu.npu.graph`
 records on the capture stream (`NPUGraph::capture_begin` uses
 `capture_stream_`), and the op tiling is computed during capture.
+
+The P/D code has been fixed accordingly: `apply_stream_limit` now targets the
+capture stream and the update stream, and is called *before* capture, with
+`allow_internal_format = False` set first.
 
 ### set_stream_limit also requires `allow_internal_format = False`
 
@@ -133,19 +135,22 @@ python benchmarks/scripts/pd_perf/test04_memory_bandwidth_contention.py \
 Compare its speedup with test01. Low speedup here but high overlap in test01
 means HBM bandwidth, not AI cores, is the limit.
 
-## Suggested follow-up on the vllm path
+## Follow-up verification after the vllm fix
 
-After the probes confirm the cause:
+The `pd_separation.py` fix is now applied:
 
-1. In `PDStreamContext.apply_stream_limit`, apply the limit to
-   `self.capture_stream` before capture (and reset it after capture), or run
-   capture on `self.stream` with the limit already applied.
-2. Set `torch_npu.npu.config.allow_internal_format = False` when
-   `VLLM_ASCEND_ENABLE_PD_SEPARATION=1` before capture.
-3. Profile both streams with the CANN profiler (`kernel_details.csv` /
-   `op_summary.csv`) to confirm the two graphs overlap and to check the
-   `BlockDim` actually reflects the configured cube/vector counts.
-4. Re-run the model-level `pd_dual_stream_microbench.py --mode pd` and compare
-   against `--mode baseline-nc-limit` (the limited sequential baseline) rather
-   than the unlimited baseline, because a single stream also pays the partition
-   cost when the limit is effective.
+1. `allow_internal_format = False` is set before capture.
+2. `apply_stream_limit` now targets `capture_stream` and `update_stream` and is
+   called *before* each `torch.npu.graph(...)`.
+
+Remaining checks on the model-level path:
+
+1. Profile both streams with the CANN profiler (`kernel_details.csv` /
+   `op_summary.csv`) to confirm the two graphs overlap and that the `BlockDim`
+   now reflects the configured cube/vector counts.
+2. Re-run `pd_dual_stream_microbench.py --mode pd` and compare against
+   `--mode baseline-nc-limit` (the limited sequential baseline) rather than the
+   unlimited baseline, because a single stream also pays the partition cost
+   when the limit is effective.
+3. Confirm `graph_task_update` (the per-step attention refresh) still produces
+   correct output with the now-limited `update_stream` tiling.
