@@ -14,10 +14,11 @@ Four scenarios are compared:
   2 steps.
 * baseline-nc   -- native vLLM single-shot prefill.  The same 200-token prompt
   is prefilled in one step (no chunking), then 128 beams decode for 2 steps.
-* baseline-nc-limit -- same steps as ``baseline-nc``, but the default stream's
-  AI-core count is limited via ``torch_npu.npu.set_stream_limit`` to match a
-  single P/D stream's partition, so the sequential prefill+decode time can be
-  compared against the dual-stream overlap.
+* baseline-nc-limit -- same steps as ``baseline-nc``, but the native aclgraphs
+  are captured with a single P/D stream's AI-core partition baked in via
+  ``torch_npu.npu.set_stream_limit`` on the capture stream (see
+  ``vllm_ascend.worker.model_runner_v1.graph_capture``), so the sequential
+  prefill+decode time can be compared against the dual-stream overlap.
 * pd            -- P/D dual-stream.  A pioneer prefill runs alone, then the
   next prefill and the pioneer's 128-beam decode run *concurrently* on two
   streams.
@@ -375,27 +376,24 @@ def timed_step(runner, scheduler_output: SchedulerOutput) -> float:
     return (t1 - t0) * 1e3  # ms
 
 
-def apply_core_limit(device: torch.device, cube_num: int, vector_num: int) -> None:
-    """Limit AI cores on the default NPU stream.
+def set_capture_core_limit_env(cube_num: int, vector_num: int) -> None:
+    """Request a capture-time core partition for the next ``build_worker``.
 
-    Used by the ``baseline-nc-limit`` scenario to run the baseline runner with
-    the same per-stream core partition as a single P/D stream (see
-    ``PDStreamContext.apply_stream_limit``).  The baseline runner executes both
-    prefill and decode on the default stream, so a single partition is applied
-    to every step.  A value of ``-1`` for either count leaves that resource on
-    the runtime default.
+    ``set_stream_limit`` is consumed at operator tiling time, so the native
+    baseline graph must be captured on a stream that already has the limit set.
+    ``build_worker`` calls ``compile_or_warm_up_model`` -> ``capture_model``,
+    which captures on a fresh stream inside ``graph_capture``.  That hook reads
+    these environment variables and applies them to the capture stream before
+    ``torch.npu.graph`` records the ops (see
+    ``vllm_ascend.worker.model_runner_v1.graph_capture``).
     """
-    if cube_num < 0 and vector_num < 0:
-        return
-    stream = torch.npu.default_stream(device)
-    print(f"[core-limit] default stream cube_num={cube_num} vector_num={vector_num}")
-    torch_npu.npu.set_stream_limit(stream, cube_num=cube_num, vector_num=vector_num)
-    stream_limit = torch_npu.npu.get_stream_limit(stream)
-    print(
-        f"[core-limit] default stream actual limit: "
-        f"cube_core_num={stream_limit.get('cube_core_num')} "
-        f"vector_core_num={stream_limit.get('vector_core_num')}"
-    )
+    os.environ["VLLM_ASCEND_CAPTURE_LIMIT_CUBE"] = str(cube_num)
+    os.environ["VLLM_ASCEND_CAPTURE_LIMIT_VECTOR"] = str(vector_num)
+
+
+def clear_capture_core_limit_env() -> None:
+    os.environ.pop("VLLM_ASCEND_CAPTURE_LIMIT_CUBE", None)
+    os.environ.pop("VLLM_ASCEND_CAPTURE_LIMIT_VECTOR", None)
 
 
 def reset_runner(runner, req_ids: set[str]) -> None:
@@ -870,27 +868,27 @@ def main() -> None:
 
     if mode in ("baseline-nc-limit", "both"):
         print("== Building baseline-nc-limit worker (single-shot prefill, limited cores) ==")
-        baseline_nc_limit_worker = build_worker(
-            args.model,
-            max_num_batched_tokens=max_num_batched_tokens,
-            max_num_seqs=args.max_num_seqs,
-            enable_pd=False,
-            enable_chunked_prefill=False,
-            block_size=args.block_size,
-            max_model_len=args.max_model_len,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            enforce_eager=args.enforce_eager,
-            profiler_config=profiler_config,
-        )
+        # ``set_stream_limit`` must be present on the capture stream *before*
+        # ``capture_model`` tiles the operators; a post-capture limit on the
+        # default stream is a no-op for aclgraph replay.  ``graph_capture``
+        # reads these variables and applies them to its fresh capture stream.
+        set_capture_core_limit_env(args.limit_cube_num, args.limit_vector_num)
+        try:
+            baseline_nc_limit_worker = build_worker(
+                args.model,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_num_seqs=args.max_num_seqs,
+                enable_pd=False,
+                enable_chunked_prefill=False,
+                block_size=args.block_size,
+                max_model_len=args.max_model_len,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                enforce_eager=args.enforce_eager,
+                profiler_config=profiler_config,
+            )
+        finally:
+            clear_capture_core_limit_env()
         baseline_nc_limit_runner = baseline_nc_limit_worker.model_runner
-        # Apply the single default-stream core partition *after* the worker has
-        # finished capture/compile, right before measurement.  This mirrors the
-        # PD path, where ``set_stream_limit`` is applied once after capture.
-        apply_core_limit(
-            baseline_nc_limit_runner.device,
-            args.limit_cube_num,
-            args.limit_vector_num,
-        )
 
         baseline_nc_limit_steps, baseline_nc_limit_reset = build_baseline_no_chunk_steps(
             baseline_nc_limit_runner, P, B, D, sampling_params

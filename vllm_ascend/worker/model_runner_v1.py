@@ -19,6 +19,7 @@
 
 import gc
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -34,6 +35,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch_npu
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -196,6 +198,43 @@ class GraphCaptureContext:
     stream: torch.npu.Stream
 
 
+def _capture_stream_limit_from_env() -> tuple[int, int]:
+    """Read the optional capture-time core partition from the environment.
+
+    ``baseline-nc-limit`` needs the same per-stream core partition as a single
+    P/D stream baked into the native graphs.  ``set_stream_limit`` is consumed
+    at operator *tiling* time (during ``torch.npu.graph`` capture), so it must
+    be applied to the capture stream before capture -- not to the replay/default
+    stream after capture.  The environment is the only channel available here
+    because ``graph_capture`` is a module-level hook patched into the upstream
+    ``GPUModelRunner`` and receives only ``device``.
+    """
+    cube = int(os.environ.get("VLLM_ASCEND_CAPTURE_LIMIT_CUBE", "-1"))
+    vector = int(os.environ.get("VLLM_ASCEND_CAPTURE_LIMIT_VECTOR", "-1"))
+    return cube, vector
+
+
+def _apply_capture_stream_limit(stream: torch.npu.Stream) -> None:
+    """Bake an optional core partition into every graph captured on ``stream``."""
+    cube, vector = _capture_stream_limit_from_env()
+    if cube < 0 and vector < 0:
+        return
+
+    # Core control is silently ignored while the private internal format is
+    # enabled, so disable it before the capture-time tiling below.
+    torch.npu.config.allow_internal_format = False
+    torch_npu.npu.set_stream_limit(stream, cube_num=cube, vector_num=vector)
+    stream_limit = torch_npu.npu.get_stream_limit(stream)
+    logger.info(
+        "Applied capture-stream core limit: requested cube_num=%s vector_num=%s, "
+        "actual cube_core_num=%s vector_core_num=%s",
+        cube,
+        vector,
+        stream_limit.get("cube_core_num"),
+        stream_limit.get("vector_core_num"),
+    )
+
+
 @contextmanager
 def graph_capture(device: torch.device):
     """
@@ -222,6 +261,10 @@ def graph_capture(device: torch.device):
     curr_stream = torch.npu.current_stream()
     if curr_stream != stream:
         stream.wait_stream(curr_stream)
+
+    # ``set_stream_limit`` is consumed at operator tiling time, so it must be
+    # set on this capture stream before ``torch.npu.graph`` records the ops.
+    _apply_capture_stream_limit(stream)
 
     with torch.npu.stream(stream), maybe_ca_context:
         yield graph_capture_context
