@@ -59,8 +59,12 @@ Core invariants (do not break these):
    them is unsafe on NPU.  Before each ``_update_attention_metadata`` we
    therefore ``stream.synchronize()`` on that context's replay stream, so the
    previous replay (and the update work it waited on) has completed.
-7. **``set_stream_limit`` is applied only when enabled** (non-negative cube/vec
-   counts), once per stream after capture.
+7. **``set_stream_limit`` is applied before capture, to the capture and update
+   streams** (non-negative cube/vec counts). Core control is consumed at
+   operator *tiling* time (``aclrtGetResInCurrentThread``), so it must be on the
+   capture stream to be baked into the graph, and on the update stream so the
+   ``graph_task_update`` re-issues use the same tiling.  It is paired with
+   ``allow_internal_format = False``.
 """
 
 from __future__ import annotations
@@ -218,26 +222,37 @@ class PDStreamContext:
     def is_captured(self) -> bool:
         return self.graph is not None
 
-    def apply_stream_limit(self) -> None:
-        """Partition AI cores for this stream (``aclrtSetStreamResLimit``)."""
+    def apply_stream_limit(self, stream: torch.npu.Stream, role: str) -> None:
+        """Partition AI cores on ``stream`` before its ops are tiled.
+
+        ``set_stream_limit`` is consumed at operator *tiling* time (via
+        ``aclrtGetResInCurrentThread``), so it must be set on the stream a graph
+        is captured on (to bake the partition into the graph) and on the stream
+        that re-issues the attention ``graph_task_update`` ops (so the update
+        re-uses the same tiling).  Setting it on the replay stream after capture
+        has no effect on aclgraph replay: replay does not re-tile, it only
+        submits the pre-captured SQE sequence.
+        """
         if self.cube_num < 0 and self.vector_num < 0:
             return
         logger.info(
-            "Setting stream limit for %s stream: cube_num=%s vector_num=%s",
+            "Setting stream limit for %s %s stream: cube_num=%s vector_num=%s",
             self.name,
+            role,
             self.cube_num,
             self.vector_num,
         )
         torch_npu.npu.set_stream_limit(
-            self.stream,
+            stream,
             cube_num=self.cube_num,
             vector_num=self.vector_num,
         )
-        stream_limit = torch_npu.npu.get_stream_limit(self.stream)
+        stream_limit = torch_npu.npu.get_stream_limit(stream)
         logger.info(
-            "Stream limit for %s stream after set: cube_core_num=%s "
+            "Stream limit for %s %s stream after set: cube_core_num=%s "
             "vector_core_num=%s",
             self.name,
+            role,
             stream_limit.get("cube_core_num"),
             stream_limit.get("vector_core_num"),
         )
@@ -311,6 +326,22 @@ class PDDualStreamGraphManager:
         reset_graph_params()
         set_graph_params(sorted({self.prefill_ctx.max_tokens, self.decode_ctx.max_tokens}))
 
+        # ``set_stream_limit`` is only effective when the private internal
+        # format is disabled; otherwise core control is silently ignored.  This
+        # is a global option and must be set before capture-time tiling.
+        if (
+            self.prefill_ctx.cube_num >= 0
+            or self.prefill_ctx.vector_num >= 0
+            or self.decode_ctx.cube_num >= 0
+            or self.decode_ctx.vector_num >= 0
+        ):
+            torch_npu.npu.config.allow_internal_format = False
+
+        # Apply the core partition *before* capture on the capture stream so it
+        # is baked into the graph, and on the update stream so the per-step
+        # ``graph_task_update`` re-issues use the same tiling.
+        self.prefill_ctx.apply_stream_limit(self.prefill_ctx.capture_stream, "capture")
+        self.prefill_ctx.apply_stream_limit(self.prefill_ctx.update_stream, "update")
         self.prefill_ctx.graph = torch.npu.NPUGraph()
         with torch.npu.graph(self.prefill_ctx.graph, stream=self.prefill_ctx.capture_stream):
             self.prefill_ctx.output = prefill_capture_fn(
@@ -319,6 +350,8 @@ class PDDualStreamGraphManager:
             )
         logger.info("Captured prefill graph on %s stream.", self.prefill_ctx.name)
 
+        self.decode_ctx.apply_stream_limit(self.decode_ctx.capture_stream, "capture")
+        self.decode_ctx.apply_stream_limit(self.decode_ctx.update_stream, "update")
         self.decode_ctx.graph = torch.npu.NPUGraph()
         with torch.npu.graph(self.decode_ctx.graph, stream=self.decode_ctx.capture_stream):
             self.decode_ctx.output = decode_capture_fn(
@@ -327,8 +360,6 @@ class PDDualStreamGraphManager:
             )
         logger.info("Captured decode graph on %s stream.", self.decode_ctx.name)
 
-        self.prefill_ctx.apply_stream_limit()
-        self.decode_ctx.apply_stream_limit()
         # One-time barrier after capture (not on the replay hot path).
         torch.npu.synchronize()
 
